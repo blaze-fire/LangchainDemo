@@ -4,4 +4,7 @@ python-dotenv
 langchain_community
 pypdf
 bs4
-langchain-text-splitters 
+langchain-text-splitters
+langchain-openai
+chromadb
+langchain-community
