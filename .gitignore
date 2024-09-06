@@ -2,3 +2,4 @@ test.ipynb
 .env
 /faiss_index
 /chroma_db
+GettingStarted.ipynb
