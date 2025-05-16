@@ -137,69 +137,58 @@ def scale_numerical_features(df_train, df_test=None):
     
     return df_train_scaled, df_test_scaled, numerical_columns, scalers
 
-# Function to prepare data for deep learning models
+# Function to prepare data for deep learning models (single input)
 def prepare_model_inputs(df_train, df_test, categorical_columns, numerical_columns):
     """
-    Prepare input features and targets for the model
+    Prepare input features and targets for the model with a single combined input
     """
     # Features (X) and target (y) for training data
-    X_train_cat = df_train[categorical_columns].values
-    X_train_num = df_train[numerical_columns].values
+    feature_columns = categorical_columns + numerical_columns
+    X_train = df_train[feature_columns].values
     y_train = df_train['ledger_amount_scaled'].values
     
     # Features (X) and target (y) for test data
-    X_test_cat = df_test[categorical_columns].values
-    X_test_num = df_test[numerical_columns].values
+    X_test = df_test[feature_columns].values
     y_test = df_test['ledger_amount_scaled'].values
     
-    return (X_train_cat, X_train_num, y_train), (X_test_cat, X_test_num, y_test)
+    return X_train, y_train, X_test, y_test, feature_columns
 
-# Build a basic DNN model
-def build_dnn_model(cat_input_dim, num_input_dim, cat_embedding_dims=32):
+# Build a basic DNN model with a single input
+def build_dnn_model(input_dim):
     """
-    Build a Deep Neural Network with separate inputs for categorical and numerical features
+    Build a Deep Neural Network with a single input for all features
     
     Parameters:
     -----------
-    cat_input_dim : int
-        Number of categorical features
-    num_input_dim : int
-        Number of numerical features
-    cat_embedding_dims : int
-        Dimension of categorical embeddings
+    input_dim : int
+        Number of input features
         
     Returns:
     --------
     model : tf.keras.Model
         Compiled Keras model
     """
-    # Categorical input and embeddings
-    cat_input = layers.Input(shape=(cat_input_dim,), name='categorical_input')
-    cat_embedding = layers.Embedding(input_dim=1000, output_dim=cat_embedding_dims)(cat_input)
-    cat_embedding = layers.Flatten()(cat_embedding)
+    # Create sequential model
+    model = Sequential([
+        # Input layer
+        layers.Input(shape=(input_dim,)),
+        
+        # Hidden layers
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        
+        layers.Dense(64, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.2),
+        
+        layers.Dense(32, activation='relu'),
+        
+        # Output layer
+        layers.Dense(1, activation='linear')
+    ])
     
-    # Numerical input
-    num_input = layers.Input(shape=(num_input_dim,), name='numerical_input')
-    
-    # Combine inputs
-    combined = layers.Concatenate()([cat_embedding, num_input])
-    
-    # Hidden layers
-    x = layers.Dense(128, activation='relu')(combined)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.3)(x)
-    
-    x = layers.Dense(64, activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.2)(x)
-    
-    x = layers.Dense(32, activation='relu')(x)
-    
-    # Output layer
-    output = layers.Dense(1, activation='linear', name='output')(x)
-    
-    # Create and compile model
-    model = models.Model(inputs=[cat_input, num_input], outputs=output)
+    # Compile model
     model.compile(
         optimizer=optimizers.Adam(learning_rate=0.001),
         loss='mse',
@@ -208,37 +197,30 @@ def build_dnn_model(cat_input_dim, num_input_dim, cat_embedding_dims=32):
     
     return model
 
-# Build an LSTM model
-def build_lstm_model(cat_input_dim, num_input_dim, cat_embedding_dims=32):
+# Build an LSTM model with a single input
+def build_lstm_model(input_dim):
     """
-    Build an LSTM model with separate inputs for categorical and numerical features
+    Build an LSTM model with a single input for all features
     """
-    # Categorical input and embeddings
-    cat_input = layers.Input(shape=(cat_input_dim,), name='categorical_input')
-    cat_embedding = layers.Embedding(input_dim=1000, output_dim=cat_embedding_dims)(cat_input)
-    cat_embedding = layers.Flatten()(cat_embedding)
+    model = Sequential([
+        # Input layer and reshape for LSTM
+        layers.Input(shape=(input_dim,)),
+        layers.Reshape((1, input_dim)),  # Reshape to (timesteps, features)
+        
+        # LSTM layers
+        layers.LSTM(64, return_sequences=True),
+        layers.LSTM(32),
+        layers.Dropout(0.2),
+        
+        # Dense layers
+        layers.Dense(32, activation='relu'),
+        layers.BatchNormalization(),
+        
+        # Output layer
+        layers.Dense(1, activation='linear')
+    ])
     
-    # Numerical input
-    num_input = layers.Input(shape=(num_input_dim,), name='numerical_input')
-    
-    # Combine inputs and reshape for LSTM
-    combined = layers.Concatenate()([cat_embedding, num_input])
-    reshaped = layers.Reshape((1, -1))(combined)  # Reshape for LSTM
-    
-    # LSTM layers
-    x = layers.LSTM(64, return_sequences=True)(reshaped)
-    x = layers.LSTM(32)(x)
-    x = layers.Dropout(0.2)(x)
-    
-    # Dense layers
-    x = layers.Dense(32, activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    
-    # Output layer
-    output = layers.Dense(1, activation='linear', name='output')(x)
-    
-    # Create and compile model
-    model = models.Model(inputs=[cat_input, num_input], outputs=output)
+    # Compile model
     model.compile(
         optimizer=optimizers.Adam(learning_rate=0.001),
         loss='mse',
@@ -247,78 +229,32 @@ def build_lstm_model(cat_input_dim, num_input_dim, cat_embedding_dims=32):
     
     return model
 
-# Build a Temporal Convolutional Network (TCN)
-def build_tcn_model(cat_input_dim, num_input_dim, cat_embedding_dims=32):
+# Build a Temporal Convolutional Network (TCN) with a single input
+def build_tcn_model(input_dim):
     """
-    Build a Temporal Convolutional Network with separate inputs for categorical and numerical features
+    Build a Temporal Convolutional Network with a single input for all features
     """
-    # Categorical input and embeddings
-    cat_input = layers.Input(shape=(cat_input_dim,), name='categorical_input')
-    cat_embedding = layers.Embedding(input_dim=1000, output_dim=cat_embedding_dims)(cat_input)
-    cat_embedding = layers.Flatten()(cat_embedding)
+    model = Sequential([
+        # Input layer and reshape for Conv1D
+        layers.Input(shape=(input_dim,)),
+        layers.Reshape((1, input_dim)),  # Reshape to (timesteps, features)
+        
+        # TCN-like architecture (Conv1D with dilations)
+        layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=1, activation='relu'),
+        layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=2, activation='relu'),
+        layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=4, activation='relu'),
+        layers.GlobalMaxPooling1D(),
+        
+        # Dense layers
+        layers.Dense(32, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.2),
+        
+        # Output layer
+        layers.Dense(1, activation='linear')
+    ])
     
-    # Numerical input
-    num_input = layers.Input(shape=(num_input_dim,), name='numerical_input')
-    
-    # Combine inputs and reshape for Conv1D
-    combined = layers.Concatenate()([cat_embedding, num_input])
-    reshaped = layers.Reshape((1, -1))(combined)  # Reshape for Conv1D
-    
-    # TCN-like architecture (Conv1D with dilations)
-    x = layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=1, activation='relu')(reshaped)
-    x = layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=2, activation='relu')(x)
-    x = layers.Conv1D(filters=64, kernel_size=2, padding='causal', dilation_rate=4, activation='relu')(x)
-    x = layers.GlobalMaxPooling1D()(x)
-    
-    # Dense layers
-    x = layers.Dense(32, activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.2)(x)
-    
-    # Output layer
-    output = layers.Dense(1, activation='linear', name='output')(x)
-    
-    # Create and compile model
-    model = models.Model(inputs=[cat_input, num_input], outputs=output)
-    model.compile(
-        optimizer=optimizers.Adam(learning_rate=0.001),
-        loss='mse',
-        metrics=['mae']
-    )
-    
-    return model
-
-# Build a Transformer model
-def build_transformer_model(cat_input_dim, num_input_dim, cat_embedding_dims=32):
-    """
-    Build a Transformer model with separate inputs for categorical and numerical features
-    """
-    # Categorical input and embeddings
-    cat_input = layers.Input(shape=(cat_input_dim,), name='categorical_input')
-    cat_embedding = layers.Embedding(input_dim=1000, output_dim=cat_embedding_dims)(cat_input)
-    cat_embedding = layers.Flatten()(cat_embedding)
-    
-    # Numerical input
-    num_input = layers.Input(shape=(num_input_dim,), name='numerical_input')
-    
-    # Combine inputs and reshape for Transformer
-    combined = layers.Concatenate()([cat_embedding, num_input])
-    reshaped = layers.Reshape((1, -1))(combined)
-    
-    # Transformer block
-    transformer_block = TransformerBlock(key_dim=16, num_heads=2, ff_dim=32)
-    x = transformer_block(reshaped)
-    x = layers.GlobalAveragePooling1D()(x)
-    
-    # Dense layers
-    x = layers.Dense(32, activation='relu')(x)
-    x = layers.Dropout(0.1)(x)
-    
-    # Output layer
-    output = layers.Dense(1, activation='linear', name='output')(x)
-    
-    # Create and compile model
-    model = models.Model(inputs=[cat_input, num_input], outputs=output)
+    # Compile model
     model.compile(
         optimizer=optimizers.Adam(learning_rate=0.001),
         loss='mse',
@@ -349,13 +285,46 @@ class TransformerBlock(layers.Layer):
         ffn_output = self.dropout2(ffn_output, training=training)
         return self.layernorm2(out1 + ffn_output)
 
+# Build a Transformer model with a single input
+def build_transformer_model(input_dim):
+    """
+    Build a Transformer model with a single input for all features
+    """
+    # Create Sequential model
+    model = Sequential([
+        # Input layer and reshape for Transformer
+        layers.Input(shape=(input_dim,)),
+        layers.Reshape((1, input_dim)),  # Reshape to (seq_length, features)
+        
+        # Add custom Transformer block
+        # Note: We define this within the function to ensure compatibility with Sequential
+        TransformerBlock(key_dim=input_dim, num_heads=2, ff_dim=32),
+        
+        # Pooling and dense layers
+        layers.GlobalAveragePooling1D(),
+        layers.Dense(32, activation='relu'),
+        layers.Dropout(0.1),
+        
+        # Output layer
+        layers.Dense(1, activation='linear')
+    ])
+    
+    # Compile model
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=0.001),
+        loss='mse',
+        metrics=['mae']
+    )
+    
+    return model
+
 # Evaluate model performance
-def evaluate_model(model, X_test_cat, X_test_num, y_test, target_scaler):
+def evaluate_model(model, X_test, y_test, target_scaler):
     """
     Evaluate model performance and return metrics
     """
     # Make predictions
-    y_pred_scaled = model.predict([X_test_cat, X_test_num])
+    y_pred_scaled = model.predict(X_test)
     
     # Inverse scale predictions and true values
     y_pred = target_scaler.inverse_transform(y_pred_scaled)
@@ -413,8 +382,8 @@ def prepare_next_quarter_data(df_train, next_quarter_month, encoders, scalers, c
         
     Returns:
     --------
-    next_quarter_features : tuple
-        Tuple of (X_cat, X_num) for the next quarter prediction
+    next_quarter_features : ndarray
+        Features for the next quarter prediction
     """
     # Get unique combinations of categorical features from training data
     unique_cat_combinations = df_train[categorical_columns].drop_duplicates()
@@ -447,10 +416,10 @@ def prepare_next_quarter_data(df_train, next_quarter_month, encoders, scalers, c
             next_quarter_df[col] = scalers[col].transform(next_quarter_df[[col]])
     
     # Extract features for model input
-    X_cat = next_quarter_df[categorical_columns].values
-    X_num = next_quarter_df[numerical_columns].values
+    feature_columns = categorical_columns + numerical_columns
+    X_next = next_quarter_df[feature_columns].values
     
-    return (X_cat, X_num)
+    return X_next
 
 # Main function to train models and predict
 def train_and_predict(train_file_path, test_month=9):
@@ -491,17 +460,20 @@ def train_and_predict(train_file_path, test_month=9):
     # Scale numerical features
     df_train_scaled, df_val_scaled, numerical_columns, scalers = scale_numerical_features(df_train_encoded, df_val_encoded)
     
-    # Prepare model inputs
-    (X_train_cat, X_train_num, y_train), (X_val_cat, X_val_num, y_val) = prepare_model_inputs(
+    # Prepare model inputs (with single combined input)
+    X_train, y_train, X_val, y_val, feature_columns = prepare_model_inputs(
         df_train_scaled, df_val_scaled, categorical_columns, numerical_columns
     )
     
+    # Calculate input dimension
+    input_dim = X_train.shape[1]
+    
     # Define models
     models = {
-        'DNN': build_dnn_model(len(categorical_columns), len(numerical_columns)),
-        'LSTM': build_lstm_model(len(categorical_columns), len(numerical_columns)),
-        'TCN': build_tcn_model(len(categorical_columns), len(numerical_columns)),
-        'Transformer': build_transformer_model(len(categorical_columns), len(numerical_columns))
+        'DNN': build_dnn_model(input_dim),
+        'LSTM': build_lstm_model(input_dim),
+        'TCN': build_tcn_model(input_dim),
+        'Transformer': build_transformer_model(input_dim)
     }
     
     # Dictionary to store trained models and their results
@@ -524,9 +496,9 @@ def train_and_predict(train_file_path, test_month=9):
     for name, model in models.items():
         print(f"\nTraining {name} model...")
         history = model.fit(
-            [X_train_cat, X_train_num],
+            X_train,
             y_train,
-            validation_data=([X_val_cat, X_val_num], y_val),
+            validation_data=(X_val, y_val),
             epochs=epochs,
             batch_size=batch_size,
             callbacks=[early_stopping],
@@ -536,7 +508,7 @@ def train_and_predict(train_file_path, test_month=9):
         # Evaluate model
         print(f"\nEvaluating {name} model...")
         eval_results = evaluate_model(
-            model, X_val_cat, X_val_num, y_val, scalers['ledger_amount']
+            model, X_val, y_val, scalers['ledger_amount']
         )
         
         print(f"{name} Results:")
