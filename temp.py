@@ -2,701 +2,438 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime, timedelta
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from datetime import datetime
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split, cross_val_score, TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, ElasticNet
 import xgboost as xgb
 import lightgbm as lgb
-from prophet import Prophet
-import statsmodels.api as sm
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM, GRU, Dropout, Conv1D, MaxPooling1D, Flatten
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization
+import warnings
+warnings.filterwarnings('ignore')
 
-# Sample data loading (replace with your actual data)
-def load_data():
-    # For demonstration - you should replace this with your actual data loading
-    # Create a sample dataset with 6 months of daily data
-    start_date = datetime(2024, 1, 1)
-    end_date = datetime(2024, 6, 30)
-    dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+# Function to load and preprocess data
+def load_and_preprocess_data(file_path):
+    """
+    Load and preprocess the data from CSV
+    """
+    # Load data
+    df = pd.read_csv(file_path)
     
-    np.random.seed(42)
-    data = {
-        'business_date': dates,
-        'ledger_amount': np.random.normal(1000, 200, len(dates)) + np.arange(len(dates)) * 2,  # trend + noise
-        'currency': np.random.choice(['USD', 'EUR', 'GBP', 'JPY'], len(dates)),
-        'custom_1': np.random.choice(['A', 'B', 'C'], len(dates)),
-        'custom_2': np.random.choice(['X', 'Y', 'Z'], len(dates)),
-        'custom_3': np.random.choice(['High', 'Medium', 'Low'], len(dates)),
-        'account_description': np.random.choice(['Revenue', 'Expense', 'Asset', 'Liability'], len(dates))
-    }
-    
-    df = pd.DataFrame(data)
+    # Convert business_date to datetime
     df['business_date'] = pd.to_datetime(df['business_date'])
-    return df
-
-# Data preprocessing
-def preprocess_data(df):
-    # Set business_date as index
-    df = df.copy()
-    df.set_index('business_date', inplace=True)
     
     # Extract date features
-    df['day_of_week'] = df.index.dayofweek
-    df['day_of_month'] = df.index.day
-    df['month'] = df.index.month
-    df['quarter'] = df.index.quarter
+    df['year'] = df['business_date'].dt.year
+    df['month'] = df['business_date'].dt.month
+    df['quarter'] = df['business_date'].dt.quarter
     
-    # Identify categorical columns
+    # Handle missing values in numerical columns
+    df['ledger_amount'] = df['ledger_amount'].fillna(df['ledger_amount'].median())
+    
+    return df
+
+# Function to create time-based features
+def create_time_features(df):
+    """
+    Create time-based features for time series forecasting
+    """
+    # Create lag features (previous quarter's values)
+    df_with_features = df.copy()
+    
+    # Sort by date
+    df_with_features = df_with_features.sort_values('business_date')
+    
+    # Group by categorical columns and create lag features
     categorical_cols = ['currency', 'custom_1', 'custom_2', 'custom_3', 'account_description']
-    numeric_cols = ['day_of_week', 'day_of_month', 'month', 'quarter']
+    available_cats = [col for col in categorical_cols if col in df_with_features.columns]
     
-    return df, categorical_cols, numeric_cols
+    # If we have enough data, create lag features by group
+    if len(df_with_features) > 1:
+        for cat in available_cats:
+            groups = df_with_features.groupby(cat)
+            
+            # Create lag features
+            for group_name, group_data in groups:
+                group_data = group_data.sort_values('business_date')
+                
+                # Add lag of ledger_amount
+                mask = df_with_features[cat] == group_name
+                df_with_features.loc[mask, 'ledger_amount_lag1'] = group_data['ledger_amount'].shift(1)
+        
+        # Fill NaN values in lag columns with mean
+        df_with_features['ledger_amount_lag1'] = df_with_features['ledger_amount_lag1'].fillna(
+            df_with_features['ledger_amount_lag1'].mean())
+    
+    return df_with_features
 
-# Feature Generation for Time Series
-def create_lag_features(df, lag_days=[1, 7, 14]):
-    df_lag = df.copy()
-    for lag in lag_days:
-        df_lag[f'ledger_amount_lag_{lag}'] = df_lag['ledger_amount'].shift(lag)
+# Function to prepare train/test sets
+def prepare_train_test(df, target_date):
+    """
+    Split data into training and test sets based on date
+    """
+    # Convert target_date to datetime if it's a string
+    if isinstance(target_date, str):
+        target_date = pd.to_datetime(target_date)
     
-    # Create rolling window features
-    df_lag['ledger_amount_rolling_mean_7'] = df_lag['ledger_amount'].rolling(window=7).mean().shift(1)
-    df_lag['ledger_amount_rolling_mean_14'] = df_lag['ledger_amount'].rolling(window=14).mean().shift(1)
-    df_lag['ledger_amount_rolling_std_7'] = df_lag['ledger_amount'].rolling(window=7).std().shift(1)
+    # Training data: all data before target_date
+    train = df[df['business_date'] < target_date].copy()
     
-    # Drop NaN values created by lag features
-    df_lag = df_lag.dropna()
+    # Test data: the target month
+    # For forecasting September, we would use the record template from June but without the target
+    latest_date = train['business_date'].max()
+    test_template = df[df['business_date'] == latest_date].copy()
     
-    return df_lag
+    # Modify the date to be the target_date
+    test_template['business_date'] = target_date
+    test_template['year'] = target_date.year
+    test_template['month'] = target_date.month
+    test_template['quarter'] = target_date.quarter
+    
+    # Remove the target from the test set
+    if 'ledger_amount' in test_template.columns:
+        test_template['ledger_amount'] = np.nan
+    
+    # Features and target for training
+    X_train = train.drop(['ledger_amount', 'business_date'], axis=1)
+    y_train = train['ledger_amount']
+    
+    # Features for test/prediction
+    X_test = test_template.drop(['ledger_amount', 'business_date'], axis=1)
+    
+    return X_train, y_train, X_test, test_template
 
-# Split data for time series evaluation
-def split_time_series_data(df):
-    # Use 80% of data for training, keep last 20% for validation
-    train_size = int(len(df) * 0.8)
-    train_data = df.iloc[:train_size]
-    val_data = df.iloc[train_size:]
+# Function to build and evaluate models
+def build_and_evaluate_models(X_train, y_train, categorical_features):
+    """
+    Build and evaluate multiple regression models
+    """
+    # Create preprocessor for mixed data types
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+    ])
     
-    return train_data, val_data
-
-# Prepare data for ML models
-def prepare_ml_features(df, categorical_cols, numeric_cols):
-    X = df.drop('ledger_amount', axis=1)
-    y = df['ledger_amount']
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    # Identify numeric features
+    numeric_features = X_train.select_dtypes(include=['int64', 'float64']).columns.tolist()
     
     # Create preprocessor
     preprocessor = ColumnTransformer(
         transformers=[
-            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols),
-            ('num', StandardScaler(), numeric_cols)
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)
         ],
         remainder='passthrough'
     )
     
-    return X, y, preprocessor
-
-# Create data for sequence models
-def create_sequences(data, seq_length=30):
-    X, y = [], []
-    for i in range(len(data) - seq_length):
-        X.append(data[i:i+seq_length])
-        y.append(data[i+seq_length])
-    return np.array(X), np.array(y)
-
-# Function to generate future dates
-def generate_future_dates(last_date, periods=31):
-    date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
-    return date_range
-
-#################################################
-# 1. STATISTICAL MODELS
-#################################################
-
-# ARIMA/SARIMA model
-def run_sarima(df):
-    print("Running SARIMA model...")
-    # Prepare the data
-    ts_data = df['ledger_amount']
-    
-    # Split data
-    train_size = int(len(ts_data) * 0.8)
-    train_data = ts_data[:train_size]
-    test_data = ts_data[train_size:]
-    
-    # Fit SARIMA model - example parameters (should be tuned)
-    model = SARIMAX(train_data, 
-                    order=(1, 1, 1),  # (p, d, q)
-                    seasonal_order=(1, 1, 1, 7),  # (P, D, Q, S)
-                    enforce_stationarity=False,
-                    enforce_invertibility=False)
-    
-    model_fit = model.fit(disp=False)
-    
-    # Make predictions for the test set
-    predictions = model_fit.forecast(steps=len(test_data))
-    
-    # Evaluate the model
-    mae = mean_absolute_error(test_data, predictions)
-    rmse = np.sqrt(mean_squared_error(test_data, predictions))
-    print(f"SARIMA - Test MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-    
-    # Forecast for July (assuming July has 31 days)
-    last_date = df.index[-1]
-    forecast_dates = generate_future_dates(last_date, 31)
-    forecast = model_fit.forecast(steps=31)
-    
-    # Create forecast DataFrame
-    forecast_df = pd.DataFrame({'business_date': forecast_dates, 'predicted_ledger_amount': forecast})
-    forecast_df.set_index('business_date', inplace=True)
-    
-    return forecast_df, model_fit
-
-# Exponential Smoothing
-def run_exponential_smoothing(df):
-    print("Running Exponential Smoothing model...")
-    # Prepare the data
-    ts_data = df['ledger_amount']
-    
-    # Split data
-    train_size = int(len(ts_data) * 0.8)
-    train_data = ts_data[:train_size]
-    test_data = ts_data[train_size:]
-    
-    # Fit Exponential Smoothing model
-    model = ExponentialSmoothing(train_data, 
-                                trend='add',
-                                seasonal='add', 
-                                seasonal_periods=7)  # assuming weekly seasonality
-    
-    model_fit = model.fit()
-    
-    # Make predictions for the test set
-    predictions = model_fit.forecast(len(test_data))
-    
-    # Evaluate the model
-    mae = mean_absolute_error(test_data, predictions)
-    rmse = np.sqrt(mean_squared_error(test_data, predictions))
-    print(f"ExponentialSmoothing - Test MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-    
-    # Forecast for July (assuming July has 31 days)
-    last_date = df.index[-1]
-    forecast_dates = generate_future_dates(last_date, 31)
-    forecast = model_fit.forecast(31)
-    
-    # Create forecast DataFrame
-    forecast_df = pd.DataFrame({'business_date': forecast_dates, 'predicted_ledger_amount': forecast})
-    forecast_df.set_index('business_date', inplace=True)
-    
-    return forecast_df, model_fit
-
-# Prophet model
-def run_prophet(df):
-    print("Running Prophet model...")
-    # Prepare data for Prophet
-    prophet_df = df.reset_index()[['business_date', 'ledger_amount']].rename(columns={
-        'business_date': 'ds', 
-        'ledger_amount': 'y'
-    })
-    
-    # Split data
-    train_size = int(len(prophet_df) * 0.8)
-    train_data = prophet_df[:train_size]
-    test_data = prophet_df[train_size:]
-    
-    # Fit Prophet model
-    model = Prophet(
-        yearly_seasonality=False,  # Only 6 months of data
-        weekly_seasonality=True,
-        daily_seasonality=False,
-        seasonality_mode='additive'
-    )
-    
-    # Add categorical regressors if needed
-    # For demonstration, we're not using them, but you could add:
-    # df_with_cat = df.reset_index()
-    # for cat_col in categorical_cols:
-    #     prophet_df[cat_col] = df_with_cat[cat_col]
-    #     model.add_regressor(cat_col)
-    
-    model.fit(train_data)
-    
-    # Create forecast dataframe for test period
-    test_dates = prophet_df.iloc[train_size:]['ds']
-    future_test = pd.DataFrame({'ds': test_dates})
-    forecast_test = model.predict(future_test)
-    
-    # Evaluate on test set
-    mae = mean_absolute_error(test_data['y'], forecast_test['yhat'])
-    rmse = np.sqrt(mean_squared_error(test_data['y'], forecast_test['yhat']))
-    print(f"Prophet - Test MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-    
-    # Forecast for July
-    last_date = df.index[-1]
-    future_dates = generate_future_dates(last_date, 31)
-    future = pd.DataFrame({'ds': future_dates})
-    
-    # Make the forecast
-    forecast = model.predict(future)
-    
-    # Create forecast DataFrame
-    forecast_df = pd.DataFrame({
-        'business_date': forecast['ds'],
-        'predicted_ledger_amount': forecast['yhat']
-    })
-    forecast_df.set_index('business_date', inplace=True)
-    
-    return forecast_df, model
-
-#################################################
-# 2. MACHINE LEARNING MODELS
-#################################################
-
-# Linear Regression
-def run_linear_regression(df, categorical_cols, numeric_cols):
-    print("Running Linear Regression model...")
-    # Create lag features
-    df_with_features = create_lag_features(df)
-    
-    # Prepare features and target
-    X, y, preprocessor = prepare_ml_features(df_with_features, categorical_cols, numeric_cols)
-    
-    # Split data
-    train_data, val_data = split_time_series_data(df_with_features)
-    X_train, y_train = prepare_ml_features(train_data, categorical_cols, numeric_cols)[:2]
-    X_val, y_val = prepare_ml_features(val_data, categorical_cols, numeric_cols)[:2]
-    
-    # Create and train pipeline
-    model = Pipeline([
-        ('preprocessor', preprocessor),
-        ('regressor', LinearRegression())
-    ])
-    
-    model.fit(X_train, y_train)
-    
-    # Evaluate
-    val_preds = model.predict(X_val)
-    mae = mean_absolute_error(y_val, val_preds)
-    rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    r2 = r2_score(y_val, val_preds)
-    print(f"Linear Regression - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.4f}")
-    
-    # Now let's prepare data for July forecast
-    # We need to create a feature set that extends into July
-    # This is a simplified version - in reality, you'd need to incrementally
-    # forecast each day and add it back to the feature set
-    
-    # For demonstration, let's assume we're forecasting just the first week of July
-    # using the trained model and the last available features
-    last_features = X.iloc[-1:].copy()  # Get the last observation's features
-    
-    # Generate forecast for July
-    # In a real application, you'd need to:
-    # 1. Incrementally forecast each day
-    # 2. Update features (including lags) with each forecast
-    # 3. Then predict the next day
-    # This is simplified for demonstration
-    
-    return model, preprocessor
-
-# Random Forest
-def run_random_forest(df, categorical_cols, numeric_cols):
-    print("Running Random Forest model...")
-    # Create lag features
-    df_with_features = create_lag_features(df)
-    
-    # Prepare features and target
-    X, y, preprocessor = prepare_ml_features(df_with_features, categorical_cols, numeric_cols)
-    
-    # Split data
-    train_data, val_data = split_time_series_data(df_with_features)
-    X_train, y_train = prepare_ml_features(train_data, categorical_cols, numeric_cols)[:2]
-    X_val, y_val = prepare_ml_features(val_data, categorical_cols, numeric_cols)[:2]
-    
-    # Create and train pipeline
-    model = Pipeline([
-        ('preprocessor', preprocessor),
-        ('regressor', RandomForestRegressor(n_estimators=100, random_state=42))
-    ])
-    
-    model.fit(X_train, y_train)
-    
-    # Evaluate
-    val_preds = model.predict(X_val)
-    mae = mean_absolute_error(y_val, val_preds)
-    rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    r2 = r2_score(y_val, val_preds)
-    print(f"Random Forest - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.4f}")
-    
-    return model, preprocessor
-
-# XGBoost
-def run_xgboost(df, categorical_cols, numeric_cols):
-    print("Running XGBoost model...")
-    # Create lag features
-    df_with_features = create_lag_features(df)
-    
-    # Prepare features and target
-    X, y, preprocessor = prepare_ml_features(df_with_features, categorical_cols, numeric_cols)
-    
-    # Split data
-    train_data, val_data = split_time_series_data(df_with_features)
-    X_train, y_train = prepare_ml_features(train_data, categorical_cols, numeric_cols)[:2]
-    X_val, y_val = prepare_ml_features(val_data, categorical_cols, numeric_cols)[:2]
-    
-    # Create and train pipeline
-    model = Pipeline([
-        ('preprocessor', preprocessor),
-        ('regressor', xgb.XGBRegressor(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=5,
-            random_state=42,
-            verbosity=0
-        ))
-    ])
-    
-    model.fit(X_train, y_train)
-    
-    # Evaluate
-    val_preds = model.predict(X_val)
-    mae = mean_absolute_error(y_val, val_preds)
-    rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    r2 = r2_score(y_val, val_preds)
-    print(f"XGBoost - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.4f}")
-    
-    return model, preprocessor
-
-# LightGBM
-def run_lightgbm(df, categorical_cols, numeric_cols):
-    print("Running LightGBM model...")
-    # Create lag features
-    df_with_features = create_lag_features(df)
-    
-    # Prepare features and target
-    X, y, preprocessor = prepare_ml_features(df_with_features, categorical_cols, numeric_cols)
-    
-    # Split data
-    train_data, val_data = split_time_series_data(df_with_features)
-    X_train, y_train = prepare_ml_features(train_data, categorical_cols, numeric_cols)[:2]
-    X_val, y_val = prepare_ml_features(val_data, categorical_cols, numeric_cols)[:2]
-    
-    # Create and train pipeline
-    model = Pipeline([
-        ('preprocessor', preprocessor),
-        ('regressor', lgb.LGBMRegressor(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=5,
-            random_state=42,
-            verbose=-1
-        ))
-    ])
-    
-    model.fit(X_train, y_train)
-    
-    # Evaluate
-    val_preds = model.predict(X_val)
-    mae = mean_absolute_error(y_val, val_preds)
-    rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    r2 = r2_score(y_val, val_preds)
-    print(f"LightGBM - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.4f}")
-    
-    return model, preprocessor
-
-#################################################
-# 3. DEEP LEARNING MODELS
-#################################################
-
-# Create features for deep learning models
-def prepare_dl_features(df, categorical_cols, look_back=30):
-    # Normalize continuous variables
-    scaler = StandardScaler()
-    scaled_amount = scaler.fit_transform(df[['ledger_amount']])
-    
-    # One-hot encode categorical variables
-    encoder = OneHotEncoder(sparse=False)
-    encoded_cats = encoder.fit_transform(df[categorical_cols])
-    
-    # Combine features
-    features = np.hstack((scaled_amount, encoded_cats))
-    
-    # Create sequences
-    X, y = create_sequences(features, look_back)
-    
-    # The target is the ledger amount (first column in our features)
-    y = y[:, 0]
-    
-    return X, y, scaler, encoder
-
-# LSTM Network
-def run_lstm(df, categorical_cols):
-    print("Running LSTM model...")
-    # Prepare data
-    look_back = 30  # Use 30 days of history to predict next day
-    X, y, scaler, encoder = prepare_dl_features(df, categorical_cols, look_back)
-    
-    # Split data
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
-    
-    # Define LSTM model
-    model = Sequential([
-        LSTM(50, activation='relu', input_shape=(look_back, X.shape[2]), return_sequences=True),
-        Dropout(0.2),
-        LSTM(25, activation='relu'),
-        Dropout(0.2),
-        Dense(1)
-    ])
-    
-    # Compile model
-    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-    
-    # Train model
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    model.fit(
-        X_train, y_train,
-        epochs=50,
-        batch_size=32,
-        validation_data=(X_val, y_val),
-        callbacks=[early_stopping],
-        verbose=0
-    )
-    
-    # Evaluate model
-    y_pred = model.predict(X_val)
-    
-    # Inverse transform to get actual values
-    y_val_original = y_val.reshape(-1, 1)  # Reshape for inverse_transform
-    y_pred_original = y_pred
-    
-    # Calculate metrics on original scale
-    mae = mean_absolute_error(y_val_original, y_pred_original)
-    rmse = np.sqrt(mean_squared_error(y_val_original, y_pred_original))
-    print(f"LSTM - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-    
-    return model
-
-# GRU Network
-def run_gru(df, categorical_cols):
-    print("Running GRU model...")
-    # Prepare data
-    look_back = 30  # Use 30 days of history to predict next day
-    X, y, scaler, encoder = prepare_dl_features(df, categorical_cols, look_back)
-    
-    # Split data
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
-    
-    # Define GRU model
-    model = Sequential([
-        GRU(50, activation='relu', input_shape=(look_back, X.shape[2]), return_sequences=True),
-        Dropout(0.2),
-        GRU(25, activation='relu'),
-        Dropout(0.2),
-        Dense(1)
-    ])
-    
-    # Compile model
-    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-    
-    # Train model
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    model.fit(
-        X_train, y_train,
-        epochs=50,
-        batch_size=32,
-        validation_data=(X_val, y_val),
-        callbacks=[early_stopping],
-        verbose=0
-    )
-    
-    # Evaluate model
-    y_pred = model.predict(X_val)
-    
-    # Calculate metrics
-    mae = mean_absolute_error(y_val, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
-    print(f"GRU - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-    
-    return model
-
-# Temporal Convolutional Network (TCN)
-def run_tcn(df, categorical_cols):
-    print("Running TCN model...")
-    # Prepare data
-    look_back = 30  # Use 30 days of history to predict next day
-    X, y, scaler, encoder = prepare_dl_features(df, categorical_cols, look_back)
-    
-    # Split data
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
-    
-    # Define TCN model (using 1D convolutions)
-    model = Sequential([
-        # First convolutional layer
-        Conv1D(filters=64, kernel_size=3, activation='relu', input_shape=(look_back, X.shape[2])),
-        MaxPooling1D(pool_size=2),
+    # Initialize models
+    models = {
+        'Linear Regression': LinearRegression(),
+        'Elastic Net': ElasticNet(alpha=0.1, l1_ratio=0.5),
+        'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42),
+        'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, random_state=42),
+        'XGBoost': xgb.XGBRegressor(n_estimators=100, random_state=42),
+        'LightGBM': lgb.LGBMRegressor(n_estimators=100, random_state=42)
+    }
+    
+    # Store results
+    results = {}
+    fitted_models = {}
+    
+    # Time series cross-validation
+    tscv = TimeSeriesSplit(n_splits=3)
+    
+    for name, model in models.items():
+        pipeline = Pipeline(steps=[
+            ('preprocessor', preprocessor),
+            ('model', model)
+        ])
         
-        # Second convolutional layer
-        Conv1D(filters=32, kernel_size=3, activation='relu'),
-        MaxPooling1D(pool_size=2),
+        # Cross-validation
+        cv_scores = cross_val_score(
+            pipeline, X_train, y_train, 
+            cv=tscv, 
+            scoring='neg_mean_squared_error'
+        )
         
-        # Flatten layer
-        Flatten(),
+        rmse_scores = np.sqrt(-cv_scores)
+        results[name] = {
+            'RMSE': rmse_scores.mean(),
+            'Std Dev': rmse_scores.std()
+        }
         
-        # Dense layers
-        Dense(50, activation='relu'),
-        Dropout(0.2),
-        Dense(1)
-    ])
+        # Fit the model on the full training data
+        pipeline.fit(X_train, y_train)
+        fitted_models[name] = pipeline
     
-    # Compile model
-    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
-    
-    # Train model
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    model.fit(
-        X_train, y_train,
-        epochs=50,
-        batch_size=32,
-        validation_data=(X_val, y_val),
-        callbacks=[early_stopping],
-        verbose=0
-    )
-    
-    # Evaluate model
-    y_pred = model.predict(X_val)
-    
-    # Calculate metrics
-    mae = mean_absolute_error(y_val, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
-    print(f"TCN - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-    
-    return model
+    return results, fitted_models
 
-# Transformer-based model
-def run_transformer(df, categorical_cols):
-    print("Running Transformer model...")
-    # Prepare data
-    look_back = 30  # Use 30 days of history to predict next day
-    X, y, scaler, encoder = prepare_dl_features(df, categorical_cols, look_back)
-    
-    # Split data
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X[:split_idx], X[split_idx:]
-    y_train, y_val = y[:split_idx], y[split_idx:]
-    
-    # Define Transformer model
-    def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
-        # Multi-head attention
-        attention_output = MultiHeadAttention(
-            key_dim=head_size, num_heads=num_heads, dropout=dropout
-        )(inputs, inputs)
-        attention_output = LayerNormalization(epsilon=1e-6)(inputs + attention_output)
-        
-        # Feed-forward network
-        ffn_output = Dense(ff_dim, activation="relu")(attention_output)
-        ffn_output = Dense(inputs.shape[-1])(ffn_output)
-        ffn_output = LayerNormalization(epsilon=1e-6)(attention_output + ffn_output)
-        
-        return ffn_output
-    
-    # Build the model
-    inputs = tf.keras.Input(shape=(look_back, X.shape[2]))
-    x = inputs
-    
-    # Transformer layers
-    x = transformer_encoder(x, head_size=64, num_heads=2, ff_dim=128, dropout=0.1)
-    x = transformer_encoder(x, head_size=64, num_heads=2, ff_dim=128, dropout=0.1)
-    
-    # Output layer
-    x = GlobalAveragePooling1D()(x)
-    x = Dropout(0.1)(x)
-    outputs = Dense(1)(x)
-    
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    
-    # Compile model
-    model.compile(optimizer=Adam(learning_rate=0.001), loss="mse")
-    
-    # Train model
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    model.fit(
-        X_train, y_train,
-        epochs=50,
-        batch_size=32,
-        validation_data=(X_val, y_val),
-        callbacks=[early_stopping],
-        verbose=0
-    )
-    
-    # Evaluate model
-    y_pred = model.predict(X_val)
-    
-    # Calculate metrics
-    mae = mean_absolute_error(y_val, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
-    print(f"Transformer - Validation MAE: {mae:.2f}, RMSE: {rmse:.2f}")
-    
-    return model
-
-#################################################
-# FORECASTING FOR JULY
-#################################################
-
-def generate_july_forecasts(df, categorical_cols, numeric_cols):
-    """Generate forecasts for July using the best models"""
-    # We'll assume July has 31 days
-    last_date = df.index[-1]  # Last date in our dataset (end of June)
-    july_dates = generate_future_dates(last_date, 31)
-    
+# Function to make forecasts with fitted models
+def make_forecasts(fitted_models, X_test):
+    """
+    Make forecasts using fitted models
+    """
     forecasts = {}
     
-    # 1. SARIMA forecast
-    sarima_forecast, _ = run_sarima(df)
-    forecasts['SARIMA'] = sarima_forecast
+    for name, model in fitted_models.items():
+        predictions = model.predict(X_test)
+        forecasts[name] = predictions
     
-    # 2. Exponential Smoothing forecast
-    es_forecast, _ = run_exponential_smoothing(df)
-    forecasts['ExponentialSmoothing'] = es_forecast
+    return forecasts
+
+# Function for SARIMAX time series model
+def fit_sarimax_model(train_data, test_template, exog_cols=None):
+    """
+    Fit a SARIMAX model for time series forecasting
+    """
+    # Prepare data for SARIMAX
+    train_data = train_data.sort_values('business_date')
     
-    # 3. Prophet forecast
-    prophet_forecast, _ = run_prophet(df)
-    forecasts['Prophet'] = prophet_forecast
+    # Group by categorical variables if present
+    results = {}
     
-    # 4. For ML models, we need a different approach due to lag features
-    # This is a simplified example - in a real implementation, you would:
-    # - Train the ML model on the entire dataset
-    # - For each day in July:
-    #   - Create features including lags
-    #   - Make a prediction
-    #   - Add the prediction to your dataset
-    #   - Move to the next day
+    if exog_cols and all(col in train_data.columns for col in exog_cols):
+        # Group by the categorical columns
+        groups = train_data.groupby(exog_cols)
+        
+        for group_name, group_data in groups:
+            # Prepare time series data
+            ts_data = group_data.set_index('business_date')['ledger_amount']
+            
+            # Create matching test data
+            test_mask = True
+            for i, col in enumerate(exog_cols):
+                test_mask = test_mask & (test_template[col] == group_name[i] if isinstance(group_name, tuple) else test_template[col] == group_name)
+            
+            test_data = test_template[test_mask]
+            
+            if len(test_data) > 0 and len(ts_data) >= 2:  # Need at least 2 observations for SARIMAX
+                try:
+                    # Fit SARIMAX model
+                    model = SARIMAX(ts_data, order=(1, 0, 0), seasonal_order=(0, 1, 0, 4))
+                    model_fit = model.fit(disp=False)
+                    
+                    # Forecast
+                    forecast = model_fit.forecast(steps=1)
+                    
+                    # Store results
+                    if isinstance(group_name, tuple):
+                        group_key = "_".join(str(g) for g in group_name)
+                    else:
+                        group_key = str(group_name)
+                        
+                    results[group_key] = forecast.iloc[0] if isinstance(forecast, pd.Series) else forecast[0]
+                except:
+                    print(f"SARIMAX failed for group {group_name}. Using average.")
+                    results[group_key] = ts_data.mean()
+    else:
+        # Fallback to simple time series on the entire dataset
+        ts_data = train_data.set_index('business_date')['ledger_amount']
+        
+        try:
+            model = SARIMAX(ts_data, order=(1, 0, 0), seasonal_order=(0, 1, 0, 4))
+            model_fit = model.fit(disp=False)
+            forecast = model_fit.forecast(steps=1)
+            results['overall'] = forecast.iloc[0] if isinstance(forecast, pd.Series) else forecast[0]
+        except:
+            print("SARIMAX failed. Using average.")
+            results['overall'] = ts_data.mean()
     
-    # 5. For DL models, similar to ML models, you need to:
-    # - Generate sequences for prediction
-    # - Make predictions for each day
-    # - Update sequences for the next day's prediction
+    return results
+
+# Function to analyze feature importance
+def analyze_feature_importance(fitted_models, X_train, categorical_features):
+    """
+    Analyze and visualize feature importance
+    """
+    # Models that support feature importance
+    models_with_importance = ['Random Forest', 'Gradient Boosting', 'XGBoost', 'LightGBM']
     
-    # For demonstration, we'll just show a simple forecast visualization
-    plt.figure(figsize=(12, 6))
+    for name in models_with_importance:
+        if name in fitted_models:
+            model = fitted_models[name]
+            
+            # Get feature names after preprocessing
+            preprocessor = model.named_steps['preprocessor']
+            model_features = (
+                preprocessor.transformers_[0][1].named_steps['imputer'].get_feature_names_out() +
+                preprocessor.transformers_[1][1].named_steps['onehot'].get_feature_names_out(categorical_features)
+            )
+            
+            # Get feature importances
+            if name in ['Random Forest', 'Gradient Boosting']:
+                importances = model.named_steps['model'].feature_importances_
+            elif name == 'XGBoost':
+                importances = model.named_steps['model'].feature_importances_
+            elif name == 'LightGBM':
+                importances = model.named_steps['model'].feature_importances_
+            
+            # Create DataFrame for visualization
+            feature_importance_df = pd.DataFrame({
+                'feature': model_features,
+                'importance': importances
+            })
+            
+            # Sort and plot
+            feature_importance_df = feature_importance_df.sort_values('importance', ascending=False).head(10)
+            
+            plt.figure(figsize=(10, 6))
+            sns.barplot(x='importance', y='feature', data=feature_importance_df)
+            plt.title(f'Feature Importance - {name}')
+            plt.tight_layout()
+            plt.show()
+
+# Main function to run the forecasting process
+def forecast_ledger_amount(file_path, target_date='2023-09-30'):
+    """
+    Complete forecasting pipeline
+    """
+    print("Loading and preprocessing data...")
+    df = load_and_preprocess_data(file_path)
     
-    # Plot the historical data
-    plt.plot(df.index, df['ledger_amount'], label='Historical Data')
+    print("Creating time features...")
+    df_with_features = create_time_features(df)
+    
+    print("Preparing train/test sets...")
+    # Identify categorical features
+    categorical_features = ['currency', 'custom_1', 'custom_2', 'custom_3', 'account_description']
+    categorical_features = [col for col in categorical_features if col in df_with_features.columns]
+    
+    # Prepare data
+    X_train, y_train, X_test, test_template = prepare_train_test(df_with_features, target_date)
+    
+    print("Building and evaluating models...")
+    results, fitted_models = build_and_evaluate_models(X_train, y_train, categorical_features)
+    
+    print("Model performance comparison:")
+    for name, metrics in results.items():
+        print(f"{name}: RMSE = {metrics['RMSE']:.2f} (±{metrics['Std Dev']:.2f})")
+    
+    print("\nMaking forecasts...")
+    forecasts = make_forecasts(fitted_models, X_test)
+    
+    print("\nSARIMAX time series forecasts...")
+    sarimax_forecasts = fit_sarimax_model(df_with_features, test_template, exog_cols=['account_description'])
+    
+    # Combine all forecasts into a DataFrame
+    forecast_df = pd.DataFrame({name: pred for name, pred in forecasts.items()})
+    
+    # Add test template info
+    for col in categorical_features:
+        if col in test_template.columns:
+            forecast_df[col] = test_template[col].values
+    
+    forecast_df['business_date'] = test_template['business_date'].values
+    
+    print("\nSummary of forecasts:")
+    forecast_means = forecast_df.mean(axis=0)
+    for model in forecasts.keys():
+        print(f"{model}: {forecast_means[model]:.2f}")
     
     # Plot forecasts
-    for model_name, forecast_df in forecasts.items():
-        plt.plot(forecast_df.index, forecast_df['
+    plt.figure(figsize=(12, 6))
+    
+    for name, preds in forecasts.items():
+        plt.plot(forecast_df.index, preds, label=name)
+    
+    plt.title("Forecasts by Different Models")
+    plt.xlabel("Observation")
+    plt.ylabel("Ledger Amount")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+    
+    print("\nAnalyzing feature importance...")
+    analyze_feature_importance(fitted_models, X_train, categorical_features)
+    
+    return forecast_df, results, fitted_models
+
+# Example usage
+if __name__ == "__main__":
+    # Replace with your file path
+    file_path = "ledger_data.csv"
+    
+    # Target date for September 2023 (assuming quarterly data)
+    target_date = '2023-09-30'
+    
+    # Run the forecasting process
+    forecasts, results, models = forecast_ledger_amount(file_path, target_date)
+    print("\nFinal forecasts:")
+    print(forecasts)
+
+# Sample function to generate synthetic data for testing
+def generate_sample_data():
+    """
+    Generate sample quarterly data for testing
+    """
+    # Create date range for two quarters
+    dates = [
+        # March data
+        *(['2023-03-01', '2023-03-15', '2023-03-31'] * 10),
+        # June data
+        *(['2023-06-01', '2023-06-15', '2023-06-30'] * 10)
+    ]
+    
+    # Create currencies
+    currencies = ['USD', 'EUR', 'GBP', 'JPY', 'CAD']
+    
+    # Create other categorical features
+    custom_1_values = ['Type1', 'Type2', 'Type3']
+    custom_2_values = ['A', 'B', 'C', 'D']
+    custom_3_values = ['High', 'Medium', 'Low']
+    account_descriptions = ['Revenue', 'Expenses', 'Assets', 'Liabilities']
+    
+    # Generate sample data
+    np.random.seed(42)
+    n_samples = len(dates)
+    
+    data = {
+        'business_date': dates,
+        'currency': np.random.choice(currencies, n_samples),
+        'custom_1': np.random.choice(custom_1_values, n_samples),
+        'custom_2': np.random.choice(custom_2_values, n_samples),
+        'custom_3': np.random.choice(custom_3_values, n_samples),
+        'account_description': np.random.choice(account_descriptions, n_samples),
+        'ledger_amount': np.random.normal(10000, 5000, n_samples)
+    }
+    
+    # Create seasonal patterns and trends
+    df = pd.DataFrame(data)
+    df['business_date'] = pd.to_datetime(df['business_date'])
+    
+    # Add seasonality by account type
+    for account in account_descriptions:
+        mask = df['account_description'] == account
+        
+        # March amounts (Q1)
+        march_mask = mask & (df['business_date'].dt.month == 3)
+        
+        # June amounts (Q2) - some increase for certain accounts
+        june_mask = mask & (df['business_date'].dt.month == 6)
+        
+        if account == 'Revenue':
+            df.loc[june_mask, 'ledger_amount'] = df.loc[june_mask, 'ledger_amount'] * 1.2  # 20% increase
+        elif account == 'Expenses':
+            df.loc[june_mask, 'ledger_amount'] = df.loc[june_mask, 'ledger_amount'] * 1.1  # 10% increase
+    
+    # Add some missing values
+    mask = np.random.choice([True, False], n_samples, p=[0.05, 0.95])
+    df.loc[mask, 'custom_2'] = np.nan
+    
+    # Save to CSV
+    df.to_csv('sample_ledger_data.csv', index=False)
+    print("Sample data generated and saved to 'sample_ledger_data.csv'")
+    return df
+
+# Uncomment to generate sample data
+# sample_data = generate_sample_data()
