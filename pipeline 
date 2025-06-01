@@ -1,0 +1,439 @@
+import mlflow
+import mlflow.sklearn
+import mlflow.projects
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+import boto3
+import os
+import yaml
+import json
+from pathlib import Path
+
+# Setup MLflow tracking
+mlflow.set_tracking_uri("mlflow-tracking")
+experiment_name = "ml-pipeline-experiment"
+mlflow.set_experiment(experiment_name)
+
+class MLflowPipeline:
+    """MLflow Pipeline with distinct steps for preprocessing, training, and prediction"""
+    
+    def __init__(self, experiment_name="ml-pipeline-experiment"):
+        self.experiment_name = experiment_name
+        mlflow.set_experiment(experiment_name)
+        self.artifact_path = "pipeline_artifacts"
+        
+    def create_pipeline_structure(self):
+        """Create MLflow project structure"""
+        project_structure = {
+            "MLproject": {
+                "name": "ml_pipeline",
+                "conda_env": "conda.yaml",
+                "entry_points": {
+                    "data_preprocessing": {
+                        "command": "python preprocess.py"
+                    },
+                    "model_training": {
+                        "command": "python train.py"
+                    },
+                    "model_prediction": {
+                        "command": "python predict.py"
+                    },
+                    "full_pipeline": {
+                        "command": "python pipeline.py"
+                    }
+                }
+            },
+            "conda.yaml": {
+                "channels": ["conda-forge"],
+                "dependencies": [
+                    "python=3.8",
+                    "pip",
+                    {"pip": ["mlflow", "scikit-learn", "pandas", "numpy", "boto3"]}
+                ]
+            }
+        }
+        return project_structure
+
+    def step_1_data_preprocessing(self, raw_data=None):
+        """Step 1: Data preprocessing pipeline step"""
+        
+        with mlflow.start_run(run_name="step_1_preprocessing", nested=True):
+            print("🔧 Step 1: Data Preprocessing...")
+            
+            # Load data (sample data for demo)
+            if raw_data is None:
+                np.random.seed(42)
+                n_samples = 1000
+                raw_data = pd.DataFrame({
+                    'feature1': np.random.normal(0, 1, n_samples),
+                    'feature2': np.random.normal(2, 1.5, n_samples),
+                    'feature3': np.random.uniform(-1, 1, n_samples),
+                    'target': np.random.choice([0, 1], n_samples, p=[0.6, 0.4])
+                })
+            
+            # Log input data info
+            mlflow.log_param("input_shape", raw_data.shape)
+            mlflow.log_param("features", list(raw_data.columns[:-1]))
+            mlflow.log_param("target_column", "target")
+            
+            # Preprocessing steps
+            X = raw_data.drop('target', axis=1)
+            y = raw_data['target']
+            
+            # Train-test split
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42, stratify=y
+            )
+            
+            # Feature scaling
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            # Log preprocessing metrics
+            mlflow.log_metric("train_samples", len(X_train_scaled))
+            mlflow.log_metric("test_samples", len(X_test_scaled))
+            mlflow.log_metric("n_features", X_train_scaled.shape[1])
+            mlflow.log_metric("class_balance", y.mean())
+            
+            # Save preprocessed data and scaler as artifacts
+            train_data = pd.DataFrame(X_train_scaled, columns=X.columns)
+            train_data['target'] = y_train.values
+            
+            test_data = pd.DataFrame(X_test_scaled, columns=X.columns)
+            test_data['target'] = y_test.values
+            
+            # Save to temporary files and log as artifacts
+            train_data.to_csv("train_data.csv", index=False)
+            test_data.to_csv("test_data.csv", index=False)
+            
+            mlflow.log_artifact("train_data.csv", self.artifact_path)
+            mlflow.log_artifact("test_data.csv", self.artifact_path)
+            
+            # Log scaler
+            import joblib
+            joblib.dump(scaler, "scaler.pkl")
+            mlflow.log_artifact("scaler.pkl", self.artifact_path)
+            
+            # Clean up temporary files
+            os.remove("train_data.csv")
+            os.remove("test_data.csv")
+            os.remove("scaler.pkl")
+            
+            preprocessing_run_id = mlflow.active_run().info.run_id
+            print(f"✓ Preprocessing completed - Run ID: {preprocessing_run_id}")
+            
+            return {
+                'train_data': train_data,
+                'test_data': test_data,
+                'scaler': scaler,
+                'run_id': preprocessing_run_id
+            }
+
+    def step_2_model_training(self, preprocessing_run_id):
+        """Step 2: Model training pipeline step"""
+        
+        with mlflow.start_run(run_name="step_2_training", nested=True):
+            print("🤖 Step 2: Model Training...")
+            
+            # Load preprocessed data from previous step
+            preprocessing_artifacts = f"runs:/{preprocessing_run_id}/{self.artifact_path}"
+            
+            # In practice, you'd download artifacts from MLflow
+            # For demo, we'll simulate loading the data
+            client = mlflow.tracking.MlflowClient()
+            artifacts = client.list_artifacts(preprocessing_run_id, self.artifact_path)
+            
+            # Log dependency on preprocessing step
+            mlflow.log_param("preprocessing_run_id", preprocessing_run_id)
+            mlflow.set_tag("pipeline_step", "training")
+            mlflow.set_tag("depends_on", preprocessing_run_id)
+            
+            # Model parameters
+            n_estimators = 100
+            max_depth = 10
+            random_state = 42
+            
+            mlflow.log_param("n_estimators", n_estimators)
+            mlflow.log_param("max_depth", max_depth)
+            mlflow.log_param("random_state", random_state)
+            mlflow.log_param("model_type", "RandomForestClassifier")
+            
+            # For demo, recreate training data (in practice, load from artifacts)
+            np.random.seed(42)
+            n_samples = 800  # Training samples
+            X_train = np.random.normal(0, 1, (n_samples, 3))
+            y_train = np.random.choice([0, 1], n_samples, p=[0.6, 0.4])
+            
+            # Train model
+            model = RandomForestClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                random_state=random_state
+            )
+            model.fit(X_train, y_train)
+            
+            # Training metrics
+            train_accuracy = model.score(X_train, y_train)
+            mlflow.log_metric("train_accuracy", train_accuracy)
+            
+            # Log model
+            mlflow.sklearn.log_model(
+                model, 
+                "model",
+                registered_model_name="pipeline_rf_classifier"
+            )
+            
+            # Log feature importance
+            feature_importance = dict(zip(
+                [f"feature_{i}" for i in range(X_train.shape[1])],
+                model.feature_importances_
+            ))
+            mlflow.log_dict(feature_importance, "feature_importance.json")
+            
+            training_run_id = mlflow.active_run().info.run_id
+            print(f"✓ Training completed - Run ID: {training_run_id}")
+            print(f"✓ Model registered as 'pipeline_rf_classifier'")
+            
+            return {
+                'model': model,
+                'run_id': training_run_id,
+                'train_accuracy': train_accuracy
+            }
+
+    def step_3_model_prediction(self, training_run_id, preprocessing_run_id):
+        """Step 3: Model prediction pipeline step"""
+        
+        with mlflow.start_run(run_name="step_3_prediction", nested=True):
+            print("🔮 Step 3: Model Prediction...")
+            
+            # Log dependencies
+            mlflow.log_param("training_run_id", training_run_id)
+            mlflow.log_param("preprocessing_run_id", preprocessing_run_id)
+            mlflow.set_tag("pipeline_step", "prediction")
+            mlflow.set_tag("depends_on", f"{preprocessing_run_id},{training_run_id}")
+            
+            # Load model from training step
+            model_uri = f"runs:/{training_run_id}/model"
+            model = mlflow.sklearn.load_model(model_uri)
+            
+            # For demo, create test data (in practice, load from preprocessing artifacts)
+            np.random.seed(123)
+            n_test = 200
+            X_test = np.random.normal(0, 1, (n_test, 3))
+            y_test = np.random.choice([0, 1], n_test, p=[0.6, 0.4])
+            
+            # Make predictions
+            predictions = model.predict(X_test)
+            probabilities = model.predict_proba(X_test)
+            
+            # Calculate metrics
+            accuracy = accuracy_score(y_test, predictions)
+            mlflow.log_metric("test_accuracy", accuracy)
+            mlflow.log_metric("predictions_made", len(predictions))
+            mlflow.log_metric("positive_predictions", np.sum(predictions))
+            mlflow.log_metric("prediction_confidence_mean", np.mean(np.max(probabilities, axis=1)))
+            
+            # Save predictions
+            predictions_df = pd.DataFrame({
+                'prediction': predictions,
+                'actual': y_test,
+                'prob_class_0': probabilities[:, 0],
+                'prob_class_1': probabilities[:, 1]
+            })
+            
+            predictions_df.to_csv("predictions.csv", index=False)
+            mlflow.log_artifact("predictions.csv", "predictions")
+            os.remove("predictions.csv")
+            
+            prediction_run_id = mlflow.active_run().info.run_id
+            print(f"✓ Prediction completed - Run ID: {prediction_run_id}")
+            print(f"✓ Test Accuracy: {accuracy:.4f}")
+            
+            return {
+                'predictions': predictions,
+                'probabilities': probabilities,
+                'accuracy': accuracy,
+                'run_id': prediction_run_id
+            }
+
+    def run_full_pipeline(self):
+        """Run the complete pipeline with all steps"""
+        
+        with mlflow.start_run(run_name="full_ml_pipeline"):
+            print("🚀 Starting Complete ML Pipeline...")
+            
+            # Set pipeline tags
+            mlflow.set_tag("pipeline_type", "full_ml_pipeline")
+            mlflow.set_tag("pipeline_version", "1.0")
+            
+            pipeline_results = {}
+            
+            try:
+                # Step 1: Preprocessing
+                preprocessing_result = self.step_1_data_preprocessing()
+                pipeline_results['preprocessing'] = preprocessing_result
+                
+                # Step 2: Training
+                training_result = self.step_2_model_training(
+                    preprocessing_result['run_id']
+                )
+                pipeline_results['training'] = training_result
+                
+                # Step 3: Prediction
+                prediction_result = self.step_3_model_prediction(
+                    training_result['run_id'],
+                    preprocessing_result['run_id']
+                )
+                pipeline_results['prediction'] = prediction_result
+                
+                # Log overall pipeline metrics
+                mlflow.log_metric("pipeline_train_accuracy", training_result['train_accuracy'])
+                mlflow.log_metric("pipeline_test_accuracy", prediction_result['accuracy'])
+                mlflow.log_param("pipeline_steps", 3)
+                
+                main_run_id = mlflow.active_run().info.run_id
+                print(f"\n✅ Pipeline completed successfully!")
+                print(f"📈 Main Pipeline Run ID: {main_run_id}")
+                print(f"🔧 Preprocessing Run ID: {preprocessing_result['run_id']}")
+                print(f"🤖 Training Run ID: {training_result['run_id']}")
+                print(f"🔮 Prediction Run ID: {prediction_result['run_id']}")
+                
+                return pipeline_results
+                
+            except Exception as e:
+                mlflow.log_param("pipeline_error", str(e))
+                mlflow.set_tag("pipeline_status", "failed")
+                print(f"❌ Pipeline failed: {str(e)}")
+                raise
+
+    def create_pipeline_config(self):
+        """Create pipeline configuration for MLflow Projects"""
+        
+        mlproject_content = """
+name: ml_pipeline
+
+conda_env: conda.yaml
+
+entry_points:
+  main:
+    command: "python pipeline_main.py"
+  
+  preprocess:
+    parameters:
+      input_path: {type: str, default: "data/raw"}
+      output_path: {type: str, default: "data/processed"}
+    command: "python preprocess_step.py --input-path {input_path} --output-path {output_path}"
+  
+  train:
+    parameters:
+      data_path: {type: str, default: "data/processed"}
+      n_estimators: {type: int, default: 100}
+      max_depth: {type: int, default: 10}
+    command: "python train_step.py --data-path {data_path} --n-estimators {n_estimators} --max-depth {max_depth}"
+  
+  predict:
+    parameters:
+      model_run_id: str
+      data_path: {type: str, default: "data/processed"}
+    command: "python predict_step.py --model-run-id {model_run_id} --data-path {data_path}"
+"""
+        
+        conda_content = """
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pip
+  - pip:
+    - mlflow
+    - scikit-learn
+    - pandas
+    - numpy
+    - boto3
+    - joblib
+"""
+        
+        return mlproject_content, conda_content
+
+# Utility functions for pipeline management
+def run_pipeline_step(step_name, **kwargs):
+    """Run individual pipeline step"""
+    pipeline = MLflowPipeline()
+    
+    if step_name == "preprocess":
+        return pipeline.step_1_data_preprocessing(**kwargs)
+    elif step_name == "train":
+        return pipeline.step_2_model_training(**kwargs)
+    elif step_name == "predict":
+        return pipeline.step_3_model_prediction(**kwargs)
+    else:
+        raise ValueError(f"Unknown step: {step_name}")
+
+def get_pipeline_runs():
+    """Get all pipeline runs with their relationships"""
+    experiment = mlflow.get_experiment_by_name(experiment_name)
+    if experiment:
+        runs = mlflow.search_runs(
+            experiment_ids=[experiment.experiment_id],
+            order_by=["start_time DESC"]
+        )
+        return runs
+    return None
+
+def load_model_from_pipeline(pipeline_run_id):
+    """Load model from a specific pipeline run"""
+    # Find the training step run
+    client = mlflow.tracking.MlflowClient()
+    run = client.get_run(pipeline_run_id)
+    
+    # Look for nested runs (training step)
+    experiment_id = run.info.experiment_id
+    nested_runs = mlflow.search_runs(
+        experiment_ids=[experiment_id],
+        filter_string=f"tags.mlflow.parentRunId = '{pipeline_run_id}' and tags.pipeline_step = 'training'"
+    )
+    
+    if not nested_runs.empty:
+        training_run_id = nested_runs.iloc[0]['run_id']
+        model_uri = f"runs:/{training_run_id}/model"
+        return mlflow.sklearn.load_model(model_uri)
+    
+    raise ValueError("Training step not found in pipeline")
+
+# Main execution
+if __name__ == "__main__":
+    # Initialize pipeline
+    pipeline = MLflowPipeline()
+    
+    # Option 1: Run complete pipeline
+    print("=== Running Complete Pipeline ===")
+    results = pipeline.run_full_pipeline()
+    
+    # Option 2: Run individual steps (uncomment to use)
+    # print("=== Running Individual Steps ===")
+    # preprocess_result = pipeline.step_1_data_preprocessing()
+    # train_result = pipeline.step_2_model_training(preprocess_result['run_id'])
+    # predict_result = pipeline.step_3_model_prediction(
+    #     train_result['run_id'], 
+    #     preprocess_result['run_id']
+    # )
+    
+    # View pipeline runs
+    print("\n📋 Recent Pipeline Runs:")
+    runs_df = get_pipeline_runs()
+    if runs_df is not None and not runs_df.empty:
+        pipeline_runs = runs_df[runs_df['tags.pipeline_type'] == 'full_ml_pipeline']
+        if not pipeline_runs.empty:
+            print(pipeline_runs[['run_id', 'status', 'start_time', 'metrics.pipeline_test_accuracy']].head())
+    
+    print(f"\n🎯 Pipeline Structure Created!")
+    print(f"📊 Check MLflow UI for detailed run tracking and lineage")
+    
+    # Create project configuration files
+    mlproject, conda = pipeline.create_pipeline_config()
+    print(f"\n📁 MLproject and conda.yaml configurations ready for MLflow Projects")
