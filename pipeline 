@@ -58,14 +58,47 @@ class MLflowPipeline:
         }
         return project_structure
 
-    def step_1_data_preprocessing(self, raw_data=None):
+    def step_1_data_preprocessing(self, X_train=None, X_test=None, y_train=None, y_test=None, raw_data=None):
         """Step 1: Data preprocessing pipeline step"""
         
         with mlflow.start_run(run_name="step_1_preprocessing", nested=True):
             print("🔧 Step 1: Data Preprocessing...")
             
-            # Load data (sample data for demo)
-            if raw_data is None:
+            # Use provided data or create sample data
+            if X_train is not None and X_test is not None and y_train is not None and y_test is not None:
+                print("✓ Using provided train/test data")
+                # Convert to DataFrame if numpy arrays
+                if isinstance(X_train, np.ndarray):
+                    feature_names = [f'feature_{i}' for i in range(X_train.shape[1])]
+                    X_train = pd.DataFrame(X_train, columns=feature_names)
+                    X_test = pd.DataFrame(X_test, columns=feature_names)
+                
+                # Log input data info
+                mlflow.log_param("input_train_shape", X_train.shape)
+                mlflow.log_param("input_test_shape", X_test.shape)
+                mlflow.log_param("features", list(X_train.columns))
+                mlflow.log_param("data_source", "user_provided")
+                
+            elif raw_data is not None:
+                print("✓ Using provided raw data for splitting")
+                # Log input data info
+                mlflow.log_param("input_shape", raw_data.shape)
+                mlflow.log_param("features", list(raw_data.columns[:-1]))
+                mlflow.log_param("target_column", "target")
+                mlflow.log_param("data_source", "raw_data_provided")
+                
+                # Preprocessing steps
+                X = raw_data.drop('target', axis=1)
+                y = raw_data['target']
+                
+                # Train-test split
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.2, random_state=42, stratify=y
+                )
+                
+            else:
+                print("✓ Using sample data for demo")
+                # Create sample data (fallback)
                 np.random.seed(42)
                 n_samples = 1000
                 raw_data = pd.DataFrame({
@@ -74,20 +107,13 @@ class MLflowPipeline:
                     'feature3': np.random.uniform(-1, 1, n_samples),
                     'target': np.random.choice([0, 1], n_samples, p=[0.6, 0.4])
                 })
-            
-            # Log input data info
-            mlflow.log_param("input_shape", raw_data.shape)
-            mlflow.log_param("features", list(raw_data.columns[:-1]))
-            mlflow.log_param("target_column", "target")
-            
-            # Preprocessing steps
-            X = raw_data.drop('target', axis=1)
-            y = raw_data['target']
-            
-            # Train-test split
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
-            )
+                
+                X = raw_data.drop('target', axis=1)
+                y = raw_data['target']
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.2, random_state=42, stratify=y
+                )
+                mlflow.log_param("data_source", "sample_generated")
             
             # Feature scaling
             scaler = StandardScaler()
@@ -134,19 +160,11 @@ class MLflowPipeline:
                 'run_id': preprocessing_run_id
             }
 
-    def step_2_model_training(self, preprocessing_run_id):
+    def step_2_model_training(self, preprocessing_run_id, X_train=None, y_train=None, n_estimators=100, max_depth=10):
         """Step 2: Model training pipeline step"""
         
         with mlflow.start_run(run_name="step_2_training", nested=True):
             print("🤖 Step 2: Model Training...")
-            
-            # Load preprocessed data from previous step
-            preprocessing_artifacts = f"runs:/{preprocessing_run_id}/{self.artifact_path}"
-            
-            # In practice, you'd download artifacts from MLflow
-            # For demo, we'll simulate loading the data
-            client = mlflow.tracking.MlflowClient()
-            artifacts = client.list_artifacts(preprocessing_run_id, self.artifact_path)
             
             # Log dependency on preprocessing step
             mlflow.log_param("preprocessing_run_id", preprocessing_run_id)
@@ -154,20 +172,35 @@ class MLflowPipeline:
             mlflow.set_tag("depends_on", preprocessing_run_id)
             
             # Model parameters
-            n_estimators = 100
-            max_depth = 10
             random_state = 42
-            
             mlflow.log_param("n_estimators", n_estimators)
             mlflow.log_param("max_depth", max_depth)
             mlflow.log_param("random_state", random_state)
             mlflow.log_param("model_type", "RandomForestClassifier")
             
-            # For demo, recreate training data (in practice, load from artifacts)
-            np.random.seed(42)
-            n_samples = 800  # Training samples
-            X_train = np.random.normal(0, 1, (n_samples, 3))
-            y_train = np.random.choice([0, 1], n_samples, p=[0.6, 0.4])
+            # Use provided training data or load from artifacts
+            if X_train is not None and y_train is not None:
+                print("✓ Using provided training data")
+                # Convert to numpy if DataFrame
+                if isinstance(X_train, pd.DataFrame):
+                    feature_names = X_train.columns.tolist()
+                    X_train_array = X_train.values
+                else:
+                    X_train_array = X_train
+                    feature_names = [f"feature_{i}" for i in range(X_train_array.shape[1])]
+                
+                mlflow.log_param("train_data_source", "user_provided")
+                mlflow.log_param("n_features", X_train_array.shape[1])
+                mlflow.log_param("feature_names", feature_names)
+            else:
+                print("⚠️ No training data provided, using sample data")
+                # Fallback to sample data
+                np.random.seed(42)
+                n_samples = 800
+                X_train_array = np.random.normal(0, 1, (n_samples, 3))
+                y_train = np.random.choice([0, 1], n_samples, p=[0.6, 0.4])
+                feature_names = [f"feature_{i}" for i in range(3)]
+                mlflow.log_param("train_data_source", "sample_generated")
             
             # Train model
             model = RandomForestClassifier(
@@ -175,11 +208,12 @@ class MLflowPipeline:
                 max_depth=max_depth,
                 random_state=random_state
             )
-            model.fit(X_train, y_train)
+            model.fit(X_train_array, y_train)
             
             # Training metrics
-            train_accuracy = model.score(X_train, y_train)
+            train_accuracy = model.score(X_train_array, y_train)
             mlflow.log_metric("train_accuracy", train_accuracy)
+            mlflow.log_metric("train_samples", len(X_train_array))
             
             # Log model
             mlflow.sklearn.log_model(
@@ -189,15 +223,13 @@ class MLflowPipeline:
             )
             
             # Log feature importance
-            feature_importance = dict(zip(
-                [f"feature_{i}" for i in range(X_train.shape[1])],
-                model.feature_importances_
-            ))
+            feature_importance = dict(zip(feature_names, model.feature_importances_))
             mlflow.log_dict(feature_importance, "feature_importance.json")
             
             training_run_id = mlflow.active_run().info.run_id
             print(f"✓ Training completed - Run ID: {training_run_id}")
             print(f"✓ Model registered as 'pipeline_rf_classifier'")
+            print(f"✓ Training Accuracy: {train_accuracy:.4f}")
             
             return {
                 'model': model,
@@ -205,7 +237,7 @@ class MLflowPipeline:
                 'train_accuracy': train_accuracy
             }
 
-    def step_3_model_prediction(self, training_run_id, preprocessing_run_id):
+    def step_3_model_prediction(self, training_run_id, preprocessing_run_id, X_test=None, y_test=None):
         """Step 3: Model prediction pipeline step"""
         
         with mlflow.start_run(run_name="step_3_prediction", nested=True):
@@ -221,15 +253,29 @@ class MLflowPipeline:
             model_uri = f"runs:/{training_run_id}/model"
             model = mlflow.sklearn.load_model(model_uri)
             
-            # For demo, create test data (in practice, load from preprocessing artifacts)
-            np.random.seed(123)
-            n_test = 200
-            X_test = np.random.normal(0, 1, (n_test, 3))
-            y_test = np.random.choice([0, 1], n_test, p=[0.6, 0.4])
+            # Use provided test data or create sample data
+            if X_test is not None and y_test is not None:
+                print("✓ Using provided test data")
+                # Convert to numpy if DataFrame
+                if isinstance(X_test, pd.DataFrame):
+                    X_test_array = X_test.values
+                else:
+                    X_test_array = X_test
+                
+                mlflow.log_param("test_data_source", "user_provided")
+                mlflow.log_param("test_shape", X_test_array.shape)
+            else:
+                print("⚠️ No test data provided, using sample data")
+                # Fallback to sample data
+                np.random.seed(123)
+                n_test = 200
+                X_test_array = np.random.normal(0, 1, (n_test, 3))
+                y_test = np.random.choice([0, 1], n_test, p=[0.6, 0.4])
+                mlflow.log_param("test_data_source", "sample_generated")
             
             # Make predictions
-            predictions = model.predict(X_test)
-            probabilities = model.predict_proba(X_test)
+            predictions = model.predict(X_test_array)
+            probabilities = model.predict_proba(X_test_array)
             
             # Calculate metrics
             accuracy = accuracy_score(y_test, predictions)
@@ -261,7 +307,7 @@ class MLflowPipeline:
                 'run_id': prediction_run_id
             }
 
-    def run_full_pipeline(self):
+    def run_full_pipeline(self, X_train=None, X_test=None, y_train=None, y_test=None, raw_data=None, model_params=None):
         """Run the complete pipeline with all steps"""
         
         with mlflow.start_run(run_name="full_ml_pipeline"):
@@ -271,23 +317,55 @@ class MLflowPipeline:
             mlflow.set_tag("pipeline_type", "full_ml_pipeline")
             mlflow.set_tag("pipeline_version", "1.0")
             
+            # Handle model parameters
+            if model_params is None:
+                model_params = {"n_estimators": 100, "max_depth": 10}
+            
+            mlflow.log_params(model_params)
+            
             pipeline_results = {}
             
             try:
                 # Step 1: Preprocessing
-                preprocessing_result = self.step_1_data_preprocessing()
+                preprocessing_result = self.step_1_data_preprocessing(
+                    X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test, raw_data=raw_data
+                )
                 pipeline_results['preprocessing'] = preprocessing_result
+                
+                # Get the processed data from preprocessing step
+                processed_X_train = preprocessing_result.get('train_data')
+                processed_X_test = preprocessing_result.get('test_data')
+                
+                # Extract features and targets if they're in DataFrame format
+                if processed_X_train is not None and 'target' in processed_X_train.columns:
+                    train_X = processed_X_train.drop('target', axis=1)
+                    train_y = processed_X_train['target']
+                else:
+                    train_X = X_train
+                    train_y = y_train
+                
+                if processed_X_test is not None and 'target' in processed_X_test.columns:
+                    test_X = processed_X_test.drop('target', axis=1)
+                    test_y = processed_X_test['target']
+                else:
+                    test_X = X_test
+                    test_y = y_test
                 
                 # Step 2: Training
                 training_result = self.step_2_model_training(
-                    preprocessing_result['run_id']
+                    preprocessing_result['run_id'],
+                    X_train=train_X,
+                    y_train=train_y,
+                    **model_params
                 )
                 pipeline_results['training'] = training_result
                 
                 # Step 3: Prediction
                 prediction_result = self.step_3_model_prediction(
                     training_result['run_id'],
-                    preprocessing_result['run_id']
+                    preprocessing_result['run_id'],
+                    X_test=test_X,
+                    y_test=test_y
                 )
                 pipeline_results['prediction'] = prediction_result
                 
@@ -302,6 +380,8 @@ class MLflowPipeline:
                 print(f"🔧 Preprocessing Run ID: {preprocessing_result['run_id']}")
                 print(f"🤖 Training Run ID: {training_result['run_id']}")
                 print(f"🔮 Prediction Run ID: {prediction_result['run_id']}")
+                print(f"📊 Train Accuracy: {training_result['train_accuracy']:.4f}")
+                print(f"📊 Test Accuracy: {prediction_result['accuracy']:.4f}")
                 
                 return pipeline_results
                 
@@ -410,18 +490,38 @@ if __name__ == "__main__":
     # Initialize pipeline
     pipeline = MLflowPipeline()
     
-    # Option 1: Run complete pipeline
-    print("=== Running Complete Pipeline ===")
+    # Example: Using your own data
+    print("=== Example 1: Using Your Own Data ===")
+    
+    # YOUR DATA - Replace these with your actual X_train, X_test, y_train, y_test
+    # X_train = your_X_train  # Shape: (n_samples, n_features)
+    # X_test = your_X_test    # Shape: (n_test_samples, n_features)  
+    # y_train = your_y_train  # Shape: (n_samples,)
+    # y_test = your_y_test    # Shape: (n_test_samples,)
+    
+    # Model parameters (optional)
+    # model_params = {
+    #     "n_estimators": 150,
+    #     "max_depth": 12
+    # }
+    
+    # Run pipeline with your data
+    # results = pipeline.run_full_pipeline(
+    #     X_train=X_train,
+    #     X_test=X_test, 
+    #     y_train=y_train,
+    #     y_test=y_test,
+    #     model_params=model_params
+    # )
+    
+    print("=== Example 2: Using Sample Data (Default) ===")
+    # Run with sample data for demonstration
     results = pipeline.run_full_pipeline()
     
-    # Option 2: Run individual steps (uncomment to use)
-    # print("=== Running Individual Steps ===")
-    # preprocess_result = pipeline.step_1_data_preprocessing()
-    # train_result = pipeline.step_2_model_training(preprocess_result['run_id'])
-    # predict_result = pipeline.step_3_model_prediction(
-    #     train_result['run_id'], 
-    #     preprocess_result['run_id']
-    # )
+    print("\n=== Example 3: Using Raw Data for Splitting ===")
+    # If you have raw data that needs splitting:
+    # raw_df = pd.DataFrame({...})  # Your raw data with target column
+    # results = pipeline.run_full_pipeline(raw_data=raw_df)
     
     # View pipeline runs
     print("\n📋 Recent Pipeline Runs:")
@@ -434,6 +534,38 @@ if __name__ == "__main__":
     print(f"\n🎯 Pipeline Structure Created!")
     print(f"📊 Check MLflow UI for detailed run tracking and lineage")
     
-    # Create project configuration files
-    mlproject, conda = pipeline.create_pipeline_config()
-    print(f"\n📁 MLproject and conda.yaml configurations ready for MLflow Projects")
+    # Usage examples:
+    print("\n" + "="*50)
+    print("HOW TO USE WITH YOUR DATA:")
+    print("="*50)
+    print("""
+# Method 1: Pass pre-split data
+pipeline = MLflowPipeline()
+results = pipeline.run_full_pipeline(
+    X_train=your_X_train,    # Your training features
+    X_test=your_X_test,      # Your test features  
+    y_train=your_y_train,    # Your training labels
+    y_test=your_y_test,      # Your test labels
+    model_params={"n_estimators": 200, "max_depth": 15}
+)
+
+# Method 2: Pass raw data (will be split automatically)
+raw_data = pd.DataFrame({
+    'feature1': [...],
+    'feature2': [...], 
+    'target': [...]
+})
+results = pipeline.run_full_pipeline(raw_data=raw_data)
+
+# Method 3: Run individual steps with your data
+preprocessing_result = pipeline.step_1_data_preprocessing(
+    X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test
+)
+training_result = pipeline.step_2_model_training(
+    preprocessing_result['run_id'], X_train=X_train, y_train=y_train
+)
+prediction_result = pipeline.step_3_model_prediction(
+    training_result['run_id'], preprocessing_result['run_id'], 
+    X_test=X_test, y_test=y_test
+)
+    """)
