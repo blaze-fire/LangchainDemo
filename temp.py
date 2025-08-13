@@ -31,7 +31,7 @@ except ImportError:
     PANDAS_AVAILABLE = False
 
 # CrewAI imports
-from crewai import Agent, Task, Crew, Process
+from crewai import Agent, Task, Crew, Process, LLM
 from crewai.tools import BaseTool, tool
 
 # LangGraph imports
@@ -281,36 +281,45 @@ def create_document_analysis_tool(documents: Dict[str, List[Document]]):
     
     return analyze_documents
 
-def create_requirements_analyst(doc_tool: BaseTool, llm_function: Callable[[str], str]) -> Agent:
+def create_crewai_llm(config: ConfigDict) -> LLM:
+    """Create CrewAI LLM configuration for Azure OpenAI"""
+    return LLM(
+        model=f"azure/{config['deployment_name']}",
+        base_url=config['azure_endpoint'],
+        api_key=config['api_key'],
+        api_version=config['api_version']
+    )
+
+def create_requirements_analyst(doc_tool, llm: LLM) -> Agent:
     """Create requirements analyst agent"""
     return Agent(
         role="Requirements Analyst",
         goal="Extract and understand functional requirements from FSD document",
         backstory="Expert in analyzing functional specification documents and identifying testable requirements",
         tools=[doc_tool],
-        llm=llm_function,
+        llm=llm,
         verbose=True
     )
 
-def create_tableau_specialist(doc_tool: BaseTool, llm_function: Callable[[str], str]) -> Agent:
+def create_tableau_specialist(doc_tool, llm: LLM) -> Agent:
     """Create Tableau specialist agent"""
     return Agent(
         role="Tableau Report Specialist",
         goal="Analyze Tableau workbook structure and identify test points",
         backstory="Specialist in Tableau reports, understanding worksheets, calculations, and data sources",
         tools=[doc_tool],
-        llm=llm_function,
+        llm=llm,
         verbose=True
     )
 
-def create_test_designer(doc_tool: BaseTool, llm_function: Callable[[str], str]) -> Agent:
+def create_test_designer(doc_tool, llm: LLM) -> Agent:
     """Create test case designer agent"""
     return Agent(
         role="Senior Test Case Designer",
         goal="Create comprehensive, high-quality test cases",
         backstory="20+ years of experience in designing test cases that exceed human quality standards",
         tools=[doc_tool],
-        llm=llm_function,
+        llm=llm,
         verbose=True
     )
 
@@ -372,16 +381,19 @@ def create_generate_tests_task(agent: Agent, requirements_task: Task, tableau_ta
         context=[requirements_task, tableau_task]
     )
 
-def setup_crew(documents: Dict[str, List[Document]], llm_function: Callable[[str], str]) -> Crew:
+def setup_crew(documents: Dict[str, List[Document]], config: ConfigDict) -> Crew:
     """Setup CrewAI agents and tasks using functional approach"""
     
-    # Create document analysis tool
+    # Create CrewAI LLM configuration
+    crewai_llm = create_crewai_llm(config)
+    
+    # Create document analysis tool (returns a decorated function)
     doc_tool = create_document_analysis_tool(documents)
     
-    # Create agents
-    requirements_analyst = create_requirements_analyst(doc_tool, llm_function)
-    tableau_specialist = create_tableau_specialist(doc_tool, llm_function)
-    test_designer = create_test_designer(doc_tool, llm_function)
+    # Create agents (crewai_llm is passed to each agent)
+    requirements_analyst = create_requirements_analyst(doc_tool, crewai_llm)
+    tableau_specialist = create_tableau_specialist(doc_tool, crewai_llm)
+    test_designer = create_test_designer(doc_tool, crewai_llm)
     
     # Create tasks
     analyze_requirements = create_analyze_requirements_task(requirements_analyst)
@@ -593,17 +605,17 @@ def main():
     # Initialize configuration
     config = create_config()
     
-    # Initialize Azure client
+    # Initialize Azure client (for validation tasks)
     client = initialize_azure_client(config)
     
     # Load documents
     documents = load_documents(config)
     
-    # Create LLM function
+    # Create LLM function (for validation)
     llm_function = create_llm_function(client, config['deployment_name'])
     
-    # Setup crew
-    crew = setup_crew(documents, llm_function)
+    # Setup crew (uses CrewAI LLM configuration)
+    crew = setup_crew(documents, config)
     
     # Setup workflow
     workflow = setup_langgraph_workflow(documents, crew, llm_function)
