@@ -1,198 +1,6 @@
-# Updated Agents
-report_analyst = Agent(
-    name="Tableau Report Analyst",
-    role="BI Dashboard Analyst",
-    goal="Extract KPIs, calculated fields, filters, and data sources from Tableau reports",
-    backstory="Skilled in reverse-engineering Tableau dashboards to understand business logic and metrics",
-    llm=create_llm(),
-    verbose=True,
-    allow_delegation=False
-)
-
-regression_analyst = Agent(
-    name="Regression Test Case Analyst",
-    role="Regression Test Case Expert",
-    goal="Analyze existing regression test cases and use them to guide generation of new test cases",
-    backstory="Experienced in identifying reusable logic and patterns from historical test cases to improve future coverage",
-    llm=create_llm(),
-    verbose=True,
-    allow_delegation=False
-)
-
-test_designer = Agent(
-    name="Test Case Generator",
-    role="QA Automation Specialist",
-    goal="Design comprehensive test cases based on business rules and report logic, covering edge cases and validations",
-    backstory="Experienced in translating business logic into robust test scenarios for data validation and reporting accuracy",
-    llm=create_llm(),
-    verbose=True,
-    allow_delegation=False
-)
-
-qa_reviewer = Agent(
-    name="QA Reviewer",
-    role="Senior QA Lead",
-    goal="Review test cases for completeness, clarity, and alignment with business requirements",
-    backstory="Ensures that test cases meet quality standards and cover all functional and reporting aspects",
-    llm=create_llm(),
-    verbose=True,
-    allow_delegation=False
-)
-
-# Updated Node Functions
-def regression_node(state):
-    regression_path = state["regression_path"]
-    regression_text = extract_text_from_excel(regression_path)
-    
-    # Get FSD rules from previous node for context
-    fsd_context = state.get("fsd_rules", "")
-    
-    regression_task = Task(
-        description=f"""
-        Analyze the regression test cases and extract reusable logic and patterns.
-        
-        Context from FSD Analysis:
-        {fsd_context}
-        
-        Regression Test Cases:
-        {regression_text}
-        
-        Extract:
-        1. Common test patterns and logic
-        2. Data validation rules being tested
-        3. Edge cases covered in existing tests
-        4. Reusable test components and utilities
-        5. Gaps that could be addressed in new test cases
-        
-        Focus on identifying patterns that align with the business rules from the FSD.
-        """,
-        agent=regression_analyst,
-        expected_output="Structured analysis of regression test patterns, reusable logic, and identified gaps"
-    )
-    
-    crew = Crew(
-        agents=[regression_analyst],
-        tasks=[regression_task],
-        process="sequential"
-    )
-    
-    result = crew.kickoff()
-    insights = result if isinstance(result, str) else str(result)
-    
-    return {
-        **state,
-        "regression_insights": insights
-    }
-
-def tableau_node(state):
-    report_folder = state["report_folder"]
-    combined_report_text = ""
-    
-    for file_name in os.listdir(report_folder):
-        if file_name.endswith(".twbx"):
-            file_path = os.path.join(report_folder, file_name)
-            report_text = extract_logic_from_twbx(file_path)
-            combined_report_text += f"\n--- Report: {file_name} ---\n{report_text}\n"
-    
-    # Get context from previous nodes
-    fsd_context = state.get("fsd_rules", "")
-    regression_context = state.get("regression_insights", "")
-    
-    tableau_task = Task(
-        description=f"""
-        Extract KPIs, calculated fields, filters, and business logic from Tableau reports.
-        
-        Context from FSD Analysis:
-        {fsd_context}
-        
-        Context from Regression Analysis:
-        {regression_context}
-        
-        Tableau Reports Content:
-        {combined_report_text}
-        
-        Extract and analyze:
-        1. Key Performance Indicators (KPIs) and metrics
-        2. Calculated fields and their business logic
-        3. Filters and parameter logic
-        4. Data source relationships and joins
-        5. Dashboard interactions and dependencies
-        6. Validation rules embedded in reports
-        
-        Cross-reference with FSD business rules to ensure alignment and identify any discrepancies.
-        """,
-        agent=report_analyst,
-        expected_output="Comprehensive analysis of Tableau report logic, KPIs, and business rules with cross-references to FSD"
-    )
-    
-    crew = Crew(
-        agents=[report_analyst],
-        tasks=[tableau_task],
-        process="sequential"
-    )
-    
-    result = crew.kickoff()
-    kpis = result if isinstance(result, str) else str(result)
-    
-    return {
-        **state,
-        "report_kpis": kpis
-    }
-
-def test_case_node(state):
-    # Gather all context from previous nodes
-    fsd_rules = state.get('fsd_rules', '')
-    report_kpis = state.get('report_kpis', '')
-    regression_insights = state.get('regression_insights', '')
-    
-    test_generation_task = Task(
-        description=f"""
-        Generate comprehensive test cases using all available context from the workflow.
-        
-        Business Rules from FSD:
-        {fsd_rules}
-        
-        KPIs and Report Logic:
-        {report_kpis}
-        
-        Regression Test Insights:
-        {regression_insights}
-        
-        Generate test cases that:
-        1. Validate all business rules identified in the FSD
-        2. Test KPIs and calculated fields from Tableau reports
-        3. Incorporate patterns and logic from regression analysis
-        4. Cover positive, negative, and edge case scenarios
-        5. Include data validation and boundary testing
-        6. Test integration points and dependencies
-        7. Validate report accuracy and data consistency
-        
-        Structure test cases with:
-        - Test Case ID and Name
-        - Objective/Purpose
-        - Pre-conditions
-        - Test Steps
-        - Expected Results
-        - Test Data Requirements
-        - Priority Level
-        """,
-        agent=test_designer,
-        expected_output="Comprehensive set of structured test cases covering functional, data validation, and reporting scenarios"
-    )
-    
-    crew = Crew(
-        agents=[test_designer],
-        tasks=[test_generation_task],
-        process="sequential"
-    )
-    
-    result = crew.kickoff()
-    test_cases = result if isinstance(result, str) else str(result)
-    
-    return {
-        **state,
-        "test_cases": test_cases
-    }
+import pandas as pd
+from crewai import Task, Crew
+import json
 
 def review_node(state):
     # Get all context for comprehensive review
@@ -201,9 +9,27 @@ def review_node(state):
     regression_insights = state.get('regression_insights', '')
     test_cases = state.get('test_cases', '')
     
+    # Read the sample regression Excel file to understand structure
+    sample_regression_path = state["regression_path"]  # Your sample file
+    sample_df = pd.read_excel(sample_regression_path)
+    
+    # Extract column structure and format information
+    column_names = list(sample_df.columns)
+    sample_rows = sample_df.head(3).to_dict('records')  # Get first 3 rows as examples
+    
+    # Convert sample structure to string for the agent
+    column_structure = {
+        "columns": column_names,
+        "sample_format": sample_rows,
+        "total_columns": len(column_names),
+        "data_types": {col: str(sample_df[col].dtype) for col in column_names}
+    }
+    
     review_task = Task(
         description=f"""
-        Review and finalize the generated test cases for completeness and quality.
+        Review and finalize the generated test cases, then format them to match the exact structure of the sample regression Excel file.
+        
+        CRITICAL REQUIREMENT: The output must be formatted as an Excel-ready structure with the EXACT same columns as the sample file.
         
         Original Business Rules (FSD):
         {fsd_rules}
@@ -217,22 +43,36 @@ def review_node(state):
         Generated Test Cases:
         {test_cases}
         
+        SAMPLE EXCEL STRUCTURE TO MATCH:
+        Column Names: {column_names}
+        Sample Format: {json.dumps(sample_rows, indent=2)}
+        Total Columns Required: {len(column_names)}
+        
+        INSTRUCTIONS:
+        1. Review the test cases for completeness and quality
+        2. Format each test case to fit the exact column structure shown above
+        3. Ensure every test case has a value for each column (use "N/A" or appropriate defaults if needed)
+        4. Match the data format and style of the sample rows
+        5. Output should be a JSON array where each object represents one test case row
+        6. Each object must have keys that exactly match the column names: {column_names}
+        
+        OUTPUT FORMAT REQUIRED:
+        Return a JSON array like this:
+        [
+            {{"{column_names[0]}": "value1", "{column_names[1]}": "value2", ...}},
+            {{"{column_names[0]}": "value1", "{column_names[1]}": "value2", ...}},
+            ...
+        ]
+        
         Review criteria:
         1. Completeness - Do test cases cover all business rules from FSD?
         2. Coverage - Are all KPIs and report logic tested?
-        3. Alignment - Do test cases align with regression insights?
-        4. Quality - Are test cases clear, actionable, and well-structured?
-        5. Traceability - Can each test case be traced back to requirements?
-        6. Feasibility - Are test cases executable with available resources?
-        
-        Provide:
-        - Final reviewed and refined test cases
-        - Coverage analysis showing mapping to business rules
-        - Recommendations for test execution priority
-        - Any gaps or additional test cases needed
+        3. Format Compliance - Does each test case match the required column structure?
+        4. Data Quality - Are all fields properly populated?
+        5. Consistency - Is the format consistent across all test cases?
         """,
         agent=qa_reviewer,
-        expected_output="Final reviewed test cases with coverage analysis and execution recommendations"
+        expected_output="JSON array of test cases formatted to match the exact Excel column structure"
     )
     
     crew = Crew(
@@ -242,9 +82,88 @@ def review_node(state):
     )
     
     result = crew.kickoff()
-    reviewed = result if isinstance(result, str) else str(result)
     
-    return {
-        **state,
-        "final_test_cases": reviewed
-    }
+    try:
+        # Parse the JSON response from the agent
+        if isinstance(result, str):
+            # Try to extract JSON from the response
+            import re
+            json_match = re.search(r'\[.*\]', result, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                test_cases_data = json.loads(json_str)
+            else:
+                raise ValueError("No valid JSON array found in response")
+        else:
+            test_cases_data = result
+        
+        # Create DataFrame with exact same structure as sample
+        output_df = pd.DataFrame(test_cases_data)
+        
+        # Ensure all required columns are present
+        for col in column_names:
+            if col not in output_df.columns:
+                output_df[col] = "N/A"
+        
+        # Reorder columns to match sample file
+        output_df = output_df[column_names]
+        
+        # Save to Excel file
+        output_path = state.get("output_path", "generated_test_cases.xlsx")
+        output_df.to_excel(output_path, index=False)
+        
+        return {
+            **state,
+            "final_test_cases": result,
+            "test_cases_excel": output_path,
+            "test_cases_dataframe": output_df.to_dict('records')
+        }
+        
+    except Exception as e:
+        print(f"Error formatting Excel output: {e}")
+        # Fallback: return original result
+        return {
+            **state,
+            "final_test_cases": result,
+            "formatting_error": str(e)
+        }
+
+# Alternative helper function to ensure better formatting
+def format_test_cases_to_excel(test_cases_json, sample_excel_path, output_path):
+    """
+    Helper function to convert test cases JSON to Excel with same format as sample
+    """
+    # Read sample structure
+    sample_df = pd.read_excel(sample_excel_path)
+    column_names = list(sample_df.columns)
+    
+    # Create output DataFrame
+    output_df = pd.DataFrame(test_cases_json)
+    
+    # Ensure all columns exist
+    for col in column_names:
+        if col not in output_df.columns:
+            output_df[col] = ""
+    
+    # Reorder and select only required columns
+    output_df = output_df[column_names]
+    
+    # Apply any data type formatting from sample
+    for col in column_names:
+        if col in sample_df.columns:
+            if sample_df[col].dtype == 'int64':
+                output_df[col] = pd.to_numeric(output_df[col], errors='coerce').fillna(0).astype(int)
+            elif sample_df[col].dtype == 'float64':
+                output_df[col] = pd.to_numeric(output_df[col], errors='coerce').fillna(0.0)
+    
+    # Save to Excel
+    output_df.to_excel(output_path, index=False)
+    return output_df
+
+# Updated state schema should include output path
+# Add this to your initial state:
+# {
+#     "regression_path": "sample_regression.xlsx",
+#     "output_path": "generated_test_cases.xlsx",
+#     ...
+# }
