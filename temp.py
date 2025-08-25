@@ -1,553 +1,405 @@
-# Tableau Test Case Generation System using LangGraph, LangChain, and OpenAI
-# Using functional programming approach
+# HYBRID LANGGRAPH + LANGCHAIN PIPELINE (per-source retrievers + weighted fusion)
+# ------------------------------------------------------------------------------
+# - Separate vector stores for: FSD, T5, Mapping, Regression
+# - Weighted retrieval for generation (regression weight=0) and review (regression > 0)
+# - Generator grounded only on FSD/T5/Mapping; Reviewer can see regression as reference
+# - Same output format as your earlier flow
+# ------------------------------------------------------------------------------
 
-import os
-import json
-from typing import Dict, List, Any, TypedDict, Annotated, Sequence
-from enum import Enum
-import operator
+import os, uuid, json, math, re
+from typing import List, Dict, Tuple, TypedDict
 
-# Core imports
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# LangGraph imports
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolExecutor, ToolInvocation
-from langgraph.checkpoint import MemorySaver
-
-# Document processing
 import pandas as pd
 from docx import Document as DocxDocument
-import openpyxl
 
-# ============================================
-# State Definition
-# ============================================
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.schema import Document
 
-class AgentState(TypedDict):
-    """State that flows through the graph"""
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    fsd_content: str
-    t5_data: Dict[str, Any]
-    disclosure_mapping: Dict[str, Any]
-    regression_samples: List[str]
-    extracted_requirements: Dict[str, Any]
-    generated_test_cases: List[Dict[str, Any]]
-    reviewed_test_cases: List[Dict[str, Any]]
-    current_agent: str
-    iteration: int
-    feedback: str
+from langgraph.graph import StateGraph, END
 
-# ============================================
-# Document Processing Functions
-# ============================================
 
-def process_fsd_document(file_path: str) -> str:
-    """Extract and process FSD Word document"""
+# =========================
+# CONFIG
+# =========================
+# Set one of these (OpenAI or Azure OpenAI). LangChain respects standard env vars.
+# export OPENAI_API_KEY="sk-..."
+# # For Azure:
+# export AZURE_OPENAI_API_KEY="..."
+# export AZURE_OPENAI_ENDPOINT="https://<your>.openai.azure.com/"
+# export AZURE_OPENAI_API_VERSION="2024-02-15-preview"
+
+EMBED_MODEL = "text-embedding-3-large"  # Azure: use your embedding deployment name via env if needed
+CHAT_MODEL_GEN = "gpt-4o-mini"          # Azure: set model="azure/<deployment-name>"
+CHAT_MODEL_REV = "gpt-4o-mini"
+
+DB_DIR = "./vectordbs_hybrid"
+os.makedirs(DB_DIR, exist_ok=True)
+
+SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=1200,
+    chunk_overlap=150,
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+
+EMB = OpenAIEmbeddings(model=EMBED_MODEL)
+llm_gen = ChatOpenAI(model=CHAT_MODEL_GEN, temperature=0)
+llm_rev = ChatOpenAI(model=CHAT_MODEL_REV, temperature=0)
+
+
+# =========================
+# LOADERS → TEXT
+# =========================
+
+def load_docx_text(path: str) -> str:
+    doc = DocxDocument(path)
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+def excel_to_summaries(path: str, source_tag: str) -> List[Dict]:
+    """Turn each sheet into a concise text summary (schema + quick stats)."""
+    xls = pd.ExcelFile(path)
+    items = []
+    for sheet in xls.sheet_names:
+        df = xls.parse(sheet)
+        schema_lines = [f"- {c}: {str(df[c].dtype)}" for c in df.columns]
+        # Small stats (avoid heavy ops)
+        stats_lines = []
+        for c in df.columns:
+            s = df[c]
+            stats_lines.append(f"- {c}: n={s.notna().sum()}, nulls={s.isna().sum()}")
+        txt = (
+            f"Source: {source_tag}\nSheet: {sheet}\n\n"
+            f"Columns:\n" + "\n".join(schema_lines) + "\n\n"
+            f"Quick Stats:\n" + "\n".join(stats_lines)
+        )
+        items.append({"text": txt, "metadata": {"source": source_tag, "sheet": sheet}})
+    return items
+
+def excel_to_records_preview(path: str, max_rows: int = 50) -> str:
+    """If you want to show small record previews to the LLM."""
+    xls = pd.ExcelFile(path)
+    first = xls.sheet_names[0]
+    df = xls.parse(first)
+    return df.head(max_rows).to_json(orient="records")
+
+
+# =========================
+# BUILD SEPARATE VECTOR STORES
+# =========================
+
+def chunk_and_index(texts_with_meta: List[Dict], persist_dir: str, collection_name: str) -> Chroma:
+    texts, metas = [], []
+    for item in texts_with_meta:
+        for chunk in SPLITTER.split_text(item["text"]):
+            texts.append(chunk)
+            md = dict(item["metadata"])
+            md["chunk_id"] = str(uuid.uuid4())
+            metas.append(md)
+    db = Chroma.from_texts(
+        texts=texts,
+        embedding=EMB,
+        metadatas=metas,
+        persist_directory=persist_dir,
+        collection_name=collection_name,
+    )
+    db.persist()
+    return db
+
+def build_all_stores(
+    fsd_docx_path: str,
+    t5_excel_path: str,
+    mapping_excel_path: str,
+    regression_excel_path: str,
+):
+    # FSD
+    fsd_text = load_docx_text(fsd_docx_path)
+    fsd_items = [{"text": fsd_text, "metadata": {"source": "fsd", "path": fsd_docx_path}}]
+    fsd_db = chunk_and_index(fsd_items, f"{DB_DIR}/fsd", "fsd")
+
+    # T5 (EFRA)
+    t5_items = excel_to_summaries(t5_excel_path, "t5")
+    t5_db = chunk_and_index(t5_items, f"{DB_DIR}/t5", "t5")
+
+    # Disclosure Mapping
+    mapping_items = excel_to_summaries(mapping_excel_path, "mapping")
+    mapping_db = chunk_and_index(mapping_items, f"{DB_DIR}/mapping", "mapping")
+
+    # Regression (as reference only)
+    reg_items = excel_to_summaries(regression_excel_path, "regression")
+    regression_db = chunk_and_index(reg_items, f"{DB_DIR}/regression", "regression")
+
+    return fsd_db, t5_db, mapping_db, regression_db
+
+
+# =========================
+# WEIGHTED RETRIEVAL (RRF)
+# =========================
+
+def retrieve_topk(db: Chroma, query: str, k: int = 6):
+    return db.similarity_search_with_score(query, k=k)
+
+def weighted_rrf(results_by_source: Dict[str, List[Tuple]], weights: Dict[str, float], k_fuse: int = 12):
+    """
+    results_by_source: {"fsd":[(doc,score),...], "t5":[...], ...}
+    weights: e.g. {"fsd":0.5,"t5":0.3,"mapping":0.2,"regression":0.0}
+    """
+    ranks: Dict[str, Dict] = {}
+    for src, results in results_by_source.items():
+        for rank, (doc, _score) in enumerate(results, start=1):
+            key = doc.metadata.get("chunk_id", id(doc))
+            contrib = weights.get(src, 0.0) * (1.0 / (60 + rank))  # standard RRF with base 60
+            if key not in ranks:
+                ranks[key] = {"doc": doc, "score": 0.0}
+            ranks[key]["score"] += contrib
+    fused = sorted(ranks.values(), key=lambda x: x["score"], reverse=True)
+    return [(x["doc"], x["score"]) for x in fused[:k_fuse]]
+
+GEN_WEIGHTS = {"fsd": 0.5, "t5": 0.3, "mapping": 0.2, "regression": 0.0}
+REVIEW_WEIGHTS = {"fsd": 0.4, "t5": 0.2, "mapping": 0.2, "regression": 0.2}
+
+def build_context(query: str, stores, for_review: bool = False) -> str:
+    fsd_db, t5_db, mapping_db, reg_db = stores
+    results = {
+        "fsd": retrieve_topk(fsd_db, query, k=6),
+        "t5": retrieve_topk(t5_db, query, k=6),
+        "mapping": retrieve_topk(mapping_db, query, k=6),
+        "regression": retrieve_topk(reg_db, query, k=6),
+    }
+    weights = REVIEW_WEIGHTS if for_review else GEN_WEIGHTS
+    fused = weighted_rrf(results, weights, k_fuse=12)
+
+    # context string with chunk tags for citations
+    ctx_lines = []
+    for i, (doc, _sc) in enumerate(fused, start=1):
+        md = doc.metadata
+        ref = f"{md.get('source')}|{md.get('sheet', md.get('path',''))}|{md.get('chunk_id','')}"
+        ctx_lines.append(f"<<<CTX-{i} [{ref}]>>>\n{doc.page_content}\n<<<END-CTX-{i}>>>")
+    return "\n".join(ctx_lines)
+
+def build_multi_aspect_context(aspects: List[str], stores, for_review: bool = False) -> str:
+    # Fuse contexts from multiple sub-queries to improve coverage
+    ctx_parts = []
+    for a in aspects:
+        ctx = build_context(a, stores, for_review=for_review)
+        if ctx.strip():
+            ctx_parts.append(f"### QUERY: {a}\n{ctx}")
+    return "\n\n".join(ctx_parts)
+
+
+# =========================
+# GRAPH STATE
+# =========================
+
+class TestGenState(TypedDict):
+    # Inputs
+    user_query: str
+    stores: tuple  # (fsd_db, t5_db, mapping_db, reg_db)
+    # Intermediate contexts
+    gen_context: str
+    review_context: str
+    # Outputs
+    test_cases: str
+    reviewed_cases: str
+
+
+# =========================
+# NODES
+# =========================
+
+def node_retrieve_generation(state: TestGenState) -> TestGenState:
+    """Build generation context from FSD/T5/Mapping only (weighted)."""
+    aspects = [
+        state["user_query"],
+        f"{state['user_query']} KPIs filters aggregations",
+        f"{state['user_query']} data types column constraints",
+        f"{state['user_query']} disclosure mapping joins drilldown",
+        f"{state['user_query']} edge cases nulls RBAC date ranges performance"
+    ]
+    ctx = build_multi_aspect_context(aspects, state["stores"], for_review=False)
+    return {**state, "gen_context": ctx}
+
+GEN_PROMPT = """You are a QA test designer for Tableau disclosures.
+
+PRIORITY OF SOURCES (strict):
+1) FSD (functional spec) – authoritative facts
+2) T5/EFRA extract – data shape, types, constraints
+3) Disclosure mapping – field-to-report linkage
+Regression examples are NOT available to you at this step.
+
+Task:
+- Generate MANUAL test cases grounded ONLY in the provided context.
+- Output strict JSON with this schema:
+{{
+  "test_cases": [
+    {{
+      "id": "TC-<auto-number>",
+      "title": "...",
+      "area": "KPI|Filter|Aggregation|UI|Export|Security|Performance|DataQuality|Join",
+      "preconditions": ["..."],
+      "steps": ["step 1", "step 2", "..."],
+      "test_data": ["..."],
+      "expected_results": ["..."],
+      "traceability": [
+         {{"source": "<fsd|t5|mapping>", "ref": "<chunk_id/sheet/page>"}}
+      ]
+    }}
+  ]
+}}
+
+Rules:
+- Prefer exact field names, KPIs, filters from the context.
+- Include negative & boundary cases (nulls, date ranges, RBAC).
+- For each expected result, include a citation to a context tag (<<<CTX-i ...>>>).
+- Do not invent report names that are not present in the context.
+Context:
+{context}
+
+User request:
+{query}
+"""
+
+def node_generate(state: TestGenState) -> TestGenState:
+    prompt = GEN_PROMPT.format(context=state["gen_context"], query=state["user_query"])
+    out = llm_gen.invoke(prompt)
+    return {**state, "test_cases": out.content}
+
+def node_retrieve_review(state: TestGenState) -> TestGenState:
+    """Build review context incl. regression (lower weight than FSD/T5/Mapping)."""
+    aspects = [
+        state["user_query"],
+        f"{state['user_query']} missing coverage risky scenarios",
+        f"{state['user_query']} navigation drilldown filter carry-forward",
+        f"{state['user_query']} SQL validation join rules"
+    ]
+    ctx = build_multi_aspect_context(aspects, state["stores"], for_review=True)
+    return {**state, "review_context": ctx}
+
+REVIEW_PROMPT = """You are a Senior QA reviewer.
+
+You will receive:
+1) Draft test cases (JSON).
+2) Context fused from FSD/T5/Mapping/Regression.
+
+Instructions:
+- Ensure every assertion is grounded in FSD/T5/Mapping. If a claim conflicts with them, mark an issue.
+- Use regression context ONLY to suggest missing categories or risky gaps; do NOT override FSD/T5/Mapping facts.
+- Enforce: coverage of KPIs, filters, aggregations, edge cases, RBAC, joins, drilldowns, exports, performance.
+- Output JSON:
+{{
+  "reviewed_test_cases": [... same schema as input but improved ...],
+  "issues": ["..."],
+  "ok": true|false
+}}
+
+Context:
+{context}
+
+Draft JSON:
+{draft}
+"""
+
+def node_review(state: TestGenState) -> TestGenState:
+    prompt = REVIEW_PROMPT.format(context=state["review_context"], draft=state["test_cases"])
+    out = llm_rev.invoke(prompt)
+    return {**state, "reviewed_cases": out.content}
+
+
+# =========================
+# GRAPH
+# =========================
+
+builder = StateGraph(TestGenState)
+builder.add_node("retrieve_generation", node_retrieve_generation)
+builder.add_node("generate", node_generate)
+builder.add_node("retrieve_review", node_retrieve_review)
+builder.add_node("review", node_review)
+
+builder.set_entry_point("retrieve_generation")
+builder.add_edge("retrieve_generation", "generate")
+builder.add_edge("generate", "retrieve_review")
+builder.add_edge("retrieve_review", "review")
+builder.add_edge("review", END)
+
+graph = builder.compile()
+
+
+# =========================
+# UTIL: CSV/Excel export
+# =========================
+
+def json_tests_to_dataframe(json_text: str) -> pd.DataFrame:
+    """Accepts either generator JSON or reviewer JSON; extracts test cases list."""
     try:
-        doc = DocxDocument(file_path)
-        content = []
-        
-        # Extract all paragraphs
-        for paragraph in doc.paragraphs:
-            if paragraph.text.strip():
-                content.append(paragraph.text.strip())
-        
-        # Extract tables if any
-        for table in doc.tables:
-            table_data = []
-            for row in table.rows:
-                row_data = [cell.text.strip() for cell in row.cells]
-                if any(row_data):
-                    table_data.append(" | ".join(row_data))
-            if table_data:
-                content.append("\nTable Data:\n" + "\n".join(table_data))
-        
-        return "\n\n".join(content)
-    except Exception as e:
-        return f"Error processing FSD document: {str(e)}"
+        obj = json.loads(json_text)
+    except Exception:
+        # Try to extract JSON block
+        m = re.search(r"\{[\s\S]*\}", json_text)
+        obj = json.loads(m.group(0)) if m else {"test_cases": []}
 
-def process_t5_extract(file_path: str) -> Dict[str, Any]:
-    """Process T5 extract Excel file"""
-    try:
-        df = pd.read_excel(file_path, sheet_name=None)
-        t5_data = {}
-        
-        for sheet_name, sheet_df in df.items():
-            # Convert DataFrame to dictionary for easier processing
-            sheet_data = {
-                "columns": sheet_df.columns.tolist(),
-                "data": sheet_df.to_dict('records'),
-                "summary": {
-                    "row_count": len(sheet_df),
-                    "column_count": len(sheet_df.columns),
-                    "data_types": sheet_df.dtypes.to_dict()
-                }
-            }
-            t5_data[sheet_name] = sheet_data
-        
-        return t5_data
-    except Exception as e:
-        return {"error": f"Error processing T5 extract: {str(e)}"}
+    test_list = []
+    if "test_cases" in obj:
+        test_list = obj["test_cases"]
+    elif "reviewed_test_cases" in obj:
+        test_list = obj["reviewed_test_cases"]
 
-def process_disclosure_mapping(file_path: str) -> Dict[str, Any]:
-    """Process disclosure mapping Excel file"""
-    try:
-        df = pd.read_excel(file_path)
-        
-        mapping_data = {
-            "mappings": df.to_dict('records'),
-            "columns": df.columns.tolist(),
-            "unique_disclosures": df['Disclosure'].unique().tolist() if 'Disclosure' in df.columns else [],
-            "unique_reports": df['Report'].unique().tolist() if 'Report' in df.columns else []
-        }
-        
-        return mapping_data
-    except Exception as e:
-        return {"error": f"Error processing disclosure mapping: {str(e)}"}
-
-def process_regression_test_cases(file_path: str) -> List[str]:
-    """Process regression test cases - keeping them minimal to reduce influence"""
-    try:
-        # Assuming regression test cases are in Excel format
-        df = pd.read_excel(file_path)
-        
-        # Extract only the structure/format, not the actual content
-        test_case_structure = []
-        
-        if 'Test_Case' in df.columns:
-            # Get only 2-3 samples for format reference
-            samples = df['Test_Case'].head(3).tolist()
-            test_case_structure = [f"Format reference: {tc[:100]}..." for tc in samples]
-        
-        return test_case_structure
-    except Exception as e:
-        return [f"Error processing regression tests: {str(e)}"]
-
-# ============================================
-# Agent Functions
-# ============================================
-
-def create_fsd_analyzer_agent(llm: ChatOpenAI):
-    """Agent to analyze FSD document and extract requirements"""
-    
-    def analyze_fsd(state: AgentState) -> Dict:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert FSD document analyzer for Tableau reports.
-            Your task is to extract ALL critical information from the FSD document that should be tested.
-            
-            Focus on:
-            1. Business rules and validations
-            2. Data transformations and calculations
-            3. Report layouts and visualizations
-            4. Filters and parameters
-            5. User interactions and workflows
-            6. Performance requirements
-            7. Data quality checks
-            8. Security and access controls
-            
-            Extract comprehensive requirements that will form the basis of test cases.
-            Be thorough and capture every testable requirement."""),
-            ("human", "FSD Content:\n{fsd_content}\n\nExtract all testable requirements:")
-        ])
-        
-        chain = prompt | llm
-        response = chain.invoke({"fsd_content": state["fsd_content"]})
-        
-        requirements = {
-            "business_rules": [],
-            "data_validations": [],
-            "ui_requirements": [],
-            "calculations": [],
-            "filters": [],
-            "performance": [],
-            "security": []
-        }
-        
-        # Parse response and categorize requirements
-        content = response.content if hasattr(response, 'content') else str(response)
-        lines = content.split('\n')
-        current_category = "business_rules"
-        
-        for line in lines:
-            line = line.strip()
-            if "business rule" in line.lower():
-                current_category = "business_rules"
-            elif "validation" in line.lower():
-                current_category = "data_validations"
-            elif "ui" in line.lower() or "layout" in line.lower():
-                current_category = "ui_requirements"
-            elif "calculation" in line.lower():
-                current_category = "calculations"
-            elif "filter" in line.lower():
-                current_category = "filters"
-            elif "performance" in line.lower():
-                current_category = "performance"
-            elif "security" in line.lower():
-                current_category = "security"
-            
-            if line and not line.startswith('#'):
-                requirements[current_category].append(line)
-        
-        state["extracted_requirements"] = requirements
-        state["messages"].append(AIMessage(content=f"Extracted requirements from FSD: {json.dumps(requirements, indent=2)}"))
-        return state
-    
-    return analyze_fsd
-
-def create_t5_analyzer_agent(llm: ChatOpenAI):
-    """Agent to analyze T5 extract data"""
-    
-    def analyze_t5(state: AgentState) -> Dict:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a data analyst specializing in T5 extracts for Tableau testing.
-            Analyze the T5 data structure and identify:
-            1. Key data fields and their relationships
-            2. Data types and formats
-            3. Potential data quality issues to test
-            4. Edge cases based on data patterns
-            5. Aggregation and grouping scenarios
-            6. Null/empty value handling
-            7. Data range validations
-            
-            Generate specific test scenarios based on the actual data structure."""),
-            ("human", "T5 Data Structure:\n{t5_data}\n\nIdentify test scenarios based on this data:")
-        ])
-        
-        chain = prompt | llm
-        t5_summary = json.dumps(state["t5_data"], indent=2)[:3000]  # Limit size for LLM
-        response = chain.invoke({"t5_data": t5_summary})
-        
-        # Update requirements with T5-specific test scenarios
-        if "extracted_requirements" not in state:
-            state["extracted_requirements"] = {}
-        
-        state["extracted_requirements"]["data_scenarios"] = response.content if hasattr(response, 'content') else str(response)
-        state["messages"].append(AIMessage(content=f"T5 analysis completed"))
-        return state
-    
-    return analyze_t5
-
-def create_disclosure_mapping_agent(llm: ChatOpenAI):
-    """Agent to analyze disclosure mapping"""
-    
-    def analyze_mapping(state: AgentState) -> Dict:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert in Tableau disclosure mapping analysis.
-            Based on the disclosure mapping data:
-            1. Identify all report-disclosure relationships
-            2. Define test cases for each mapping
-            3. Verify data flow between reports and disclosures
-            4. Check for consistency across mappings
-            5. Validate business logic in mappings
-            
-            Focus on creating test cases that verify the accuracy of these mappings."""),
-            ("human", "Disclosure Mapping:\n{mapping_data}\n\nGenerate mapping-specific test requirements:")
-        ])
-        
-        chain = prompt | llm
-        mapping_summary = json.dumps(state["disclosure_mapping"], indent=2)[:3000]
-        response = chain.invoke({"mapping_data": mapping_summary})
-        
-        if "extracted_requirements" not in state:
-            state["extracted_requirements"] = {}
-        
-        state["extracted_requirements"]["mapping_tests"] = response.content if hasattr(response, 'content') else str(response)
-        state["messages"].append(AIMessage(content=f"Disclosure mapping analysis completed"))
-        return state
-    
-    return analyze_mapping
-
-def create_test_generator_agent(llm: ChatOpenAI):
-    """Main agent to generate test cases"""
-    
-    def generate_tests(state: AgentState) -> Dict:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a senior QA engineer generating comprehensive test cases for Tableau reports.
-            
-            PRIORITY: Base test cases PRIMARILY on:
-            1. FSD requirements (60% weight)
-            2. T5 data structure and scenarios (25% weight)
-            3. Disclosure mappings (10% weight)
-            4. Regression test format only (5% weight - structure only, not content)
-            
-            Generate test cases with:
-            - Test Case ID
-            - Test Case Name
-            - Description
-            - Pre-conditions
-            - Test Steps (detailed)
-            - Expected Results
-            - Test Data
-            - Priority (High/Medium/Low)
-            - Category
-            
-            Create diverse test cases covering:
-            - Functional testing
-            - Data validation
-            - UI/UX testing
-            - Performance testing
-            - Security testing
-            - Integration testing
-            - Edge cases
-            
-            IMPORTANT: Focus on NEW requirements from FSD, not historical patterns."""),
-            ("human", """Requirements: {requirements}
-            
-            Regression Format Reference (use format only): {regression_samples}
-            
-            Generate comprehensive test cases based primarily on the requirements:""")
-        ])
-        
-        chain = prompt | llm
-        
-        # Prepare requirements summary
-        req_summary = json.dumps(state["extracted_requirements"], indent=2)[:5000]
-        
-        # Minimal regression reference
-        regression_ref = state["regression_samples"][:2] if state["regression_samples"] else ["No format reference"]
-        
-        response = chain.invoke({
-            "requirements": req_summary,
-            "regression_samples": "\n".join(regression_ref)
+    rows = []
+    for tc in test_list:
+        rows.append({
+            "id": tc.get("id", ""),
+            "area": tc.get("area", ""),
+            "title": tc.get("title", ""),
+            "preconditions": " | ".join(tc.get("preconditions", [])),
+            "steps": " | ".join(tc.get("steps", [])),
+            "test_data": " | ".join(tc.get("test_data", [])),
+            "expected_results": " | ".join(tc.get("expected_results", [])),
+            "traceability": " | ".join([f"{t.get('source','')}:{t.get('ref','')}" for t in tc.get("traceability", [])]),
         })
-        
-        # Parse response into structured test cases
-        content = response.content if hasattr(response, 'content') else str(response)
-        
-        # Simple parsing - in production, use more sophisticated parsing
-        test_cases = []
-        current_test = {}
-        
-        for line in content.split('\n'):
-            if "Test Case ID:" in line:
-                if current_test:
-                    test_cases.append(current_test)
-                current_test = {"id": line.replace("Test Case ID:", "").strip()}
-            elif "Test Case Name:" in line:
-                current_test["name"] = line.replace("Test Case Name:", "").strip()
-            elif "Description:" in line:
-                current_test["description"] = line.replace("Description:", "").strip()
-            elif "Priority:" in line:
-                current_test["priority"] = line.replace("Priority:", "").strip()
-            elif "Category:" in line:
-                current_test["category"] = line.replace("Category:", "").strip()
-        
-        if current_test:
-            test_cases.append(current_test)
-        
-        state["generated_test_cases"] = test_cases
-        state["messages"].append(AIMessage(content=f"Generated {len(test_cases)} test cases"))
-        return state
-    
-    return generate_tests
+    return pd.DataFrame(rows)
 
-def create_review_agent(llm: ChatOpenAI):
-    """Agent to review and enhance test cases"""
-    
-    def review_tests(state: AgentState) -> Dict:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a QA lead reviewing test cases for completeness and quality.
-            
-            Review criteria:
-            1. Coverage of all FSD requirements
-            2. Proper test case structure and clarity
-            3. Testability and feasibility
-            4. No redundancy or gaps
-            5. Alignment with T5 data and disclosure mappings
-            6. Clear expected results
-            7. Appropriate priority levels
-            
-            Provide:
-            - Overall quality score (1-10)
-            - Coverage assessment
-            - Improvements made
-            - Recommendations for additional tests
-            
-            ENSURE: Test cases are NOT copies of regression tests but new cases based on current requirements."""),
-            ("human", """Generated Test Cases: {test_cases}
-            
-            Original Requirements: {requirements}
-            
-            Review and enhance these test cases:""")
-        ])
-        
-        chain = prompt | llm
-        
-        response = chain.invoke({
-            "test_cases": json.dumps(state["generated_test_cases"], indent=2)[:4000],
-            "requirements": json.dumps(state["extracted_requirements"], indent=2)[:2000]
-        })
-        
-        # Add review feedback
-        state["reviewed_test_cases"] = state["generated_test_cases"]
-        state["feedback"] = response.content if hasattr(response, 'content') else str(response)
-        state["messages"].append(AIMessage(content=f"Review completed: {state['feedback'][:200]}..."))
-        return state
-    
-    return review_tests
+def save_tests_to_csv(json_text: str, out_path: str = "./generated_test_cases.csv"):
+    df = json_tests_to_dataframe(json_text)
+    df.to_csv(out_path, index=False)
+    return out_path
 
-# ============================================
-# Graph Construction
-# ============================================
 
-def build_test_generation_graph(llm: ChatOpenAI):
-    """Build the LangGraph workflow"""
-    
-    # Create agents
-    fsd_analyzer = create_fsd_analyzer_agent(llm)
-    t5_analyzer = create_t5_analyzer_agent(llm)
-    mapping_analyzer = create_disclosure_mapping_agent(llm)
-    test_generator = create_test_generator_agent(llm)
-    reviewer = create_review_agent(llm)
-    
-    # Create workflow
-    workflow = StateGraph(AgentState)
-    
-    # Add nodes
-    workflow.add_node("fsd_analysis", fsd_analyzer)
-    workflow.add_node("t5_analysis", t5_analyzer)
-    workflow.add_node("mapping_analysis", mapping_analyzer)
-    workflow.add_node("test_generation", test_generator)
-    workflow.add_node("review", reviewer)
-    
-    # Define edges
-    workflow.set_entry_point("fsd_analysis")
-    workflow.add_edge("fsd_analysis", "t5_analysis")
-    workflow.add_edge("t5_analysis", "mapping_analysis")
-    workflow.add_edge("mapping_analysis", "test_generation")
-    workflow.add_edge("test_generation", "review")
-    workflow.add_edge("review", END)
-    
-    # Compile
-    memory = MemorySaver()
-    app = workflow.compile(checkpointer=memory)
-    
-    return app
-
-# ============================================
-# Main Execution Function
-# ============================================
-
-def generate_tableau_test_cases(
-    fsd_path: str,
-    t5_path: str,
-    mapping_path: str,
-    regression_path: str,
-    openai_api_key: str,
-    model: str = "gpt-4-turbo-preview"
-) -> Dict[str, Any]:
-    """Main function to generate test cases"""
-    
-    # Initialize LLM
-    llm = ChatOpenAI(
-        api_key=openai_api_key,
-        model=model,
-        temperature=0.3  # Lower temperature for more consistent output
-    )
-    
-    # Process input documents
-    print("Processing input documents...")
-    fsd_content = process_fsd_document(fsd_path)
-    t5_data = process_t5_extract(t5_path)
-    disclosure_mapping = process_disclosure_mapping(mapping_path)
-    regression_samples = process_regression_test_cases(regression_path)
-    
-    # Build graph
-    print("Building workflow graph...")
-    app = build_test_generation_graph(llm)
-    
-    # Prepare initial state
-    initial_state = {
-        "messages": [HumanMessage(content="Starting test case generation")],
-        "fsd_content": fsd_content,
-        "t5_data": t5_data,
-        "disclosure_mapping": disclosure_mapping,
-        "regression_samples": regression_samples,
-        "extracted_requirements": {},
-        "generated_test_cases": [],
-        "reviewed_test_cases": [],
-        "current_agent": "fsd_analysis",
-        "iteration": 0,
-        "feedback": ""
-    }
-    
-    # Run the workflow
-    print("Executing workflow...")
-    config = {"configurable": {"thread_id": "test_generation_1"}}
-    
-    final_state = None
-    for output in app.stream(initial_state, config):
-        for key, value in output.items():
-            print(f"Completed: {key}")
-            final_state = value
-    
-    return {
-        "test_cases": final_state.get("reviewed_test_cases", []),
-        "requirements": final_state.get("extracted_requirements", {}),
-        "feedback": final_state.get("feedback", ""),
-        "messages": [msg.content for msg in final_state.get("messages", [])]
-    }
-
-# ============================================
-# Export Functions
-# ============================================
-
-def export_test_cases_to_excel(test_cases: List[Dict], output_path: str):
-    """Export test cases to Excel format"""
-    df = pd.DataFrame(test_cases)
-    df.to_excel(output_path, index=False)
-    print(f"Test cases exported to {output_path}")
-
-def export_test_cases_to_json(test_cases: List[Dict], output_path: str):
-    """Export test cases to JSON format"""
-    with open(output_path, 'w') as f:
-        json.dump(test_cases, f, indent=2)
-    print(f"Test cases exported to {output_path}")
-
-# ============================================
-# Usage Example
-# ============================================
-
-def main():
-    """Example usage"""
-    
-    # Configuration
-    config = {
-        "fsd_path": "path/to/fsd_document.docx",
-        "t5_path": "path/to/t5_extract.xlsx",
-        "mapping_path": "path/to/disclosure_mapping.xlsx",
-        "regression_path": "path/to/regression_tests.xlsx",
-        "openai_api_key": "your-openai-api-key",
-        "model": "gpt-4-turbo-preview"
-    }
-    
-    # Generate test cases
-    results = generate_tableau_test_cases(**config)
-    
-    # Export results
-    export_test_cases_to_excel(
-        results["test_cases"],
-        "generated_test_cases.xlsx"
-    )
-    
-    export_test_cases_to_json(
-        results["test_cases"],
-        "generated_test_cases.json"
-    )
-    
-    # Print summary
-    print("\n" + "="*50)
-    print("Test Generation Summary")
-    print("="*50)
-    print(f"Total test cases generated: {len(results['test_cases'])}")
-    print(f"\nReview Feedback:\n{results['feedback']}")
-    
-    return results
-
+# =========================
+# MAIN (example)
+# =========================
 if __name__ == "__main__":
-    results = main()
+    # --- Paths (replace with your actual files) ---
+    fsd_docx_path = "fsd_docs/EFRA_Reporting_Layer_FSD.docx"
+    t5_excel_path = "t5_extract/EFRA_T5_Table.xlsx"
+    mapping_excel_path = "disclosure/derivative_screen.xlsx"
+    regression_excel_path = "regression/Regression_test_cases.xlsx"
+
+    # Build (or reuse) the 4 vector stores
+    fsd_db, t5_db, mapping_db, reg_db = build_all_stores(
+        fsd_docx_path, t5_excel_path, mapping_excel_path, regression_excel_path
+    )
+
+    # User request / scope
+    user_query = "Generate comprehensive manual test cases for the new <Disclosure Name> Tableau report."
+
+    # Run the graph
+    state: TestGenState = {
+        "user_query": user_query,
+        "stores": (fsd_db, t5_db, mapping_db, reg_db),
+        "gen_context": "",
+        "review_context": "",
+        "test_cases": "",
+        "reviewed_cases": "",
+    }
+
+    final = graph.invoke(state)
+
+    print("\n=== GENERATOR OUTPUT ===\n")
+    print(final["test_cases"][:2000])  # preview
+
+    print("\n=== REVIEWER OUTPUT ===\n")
+    print(final["reviewed_cases"][:2000])  # preview
+
+    # Save to CSV (from reviewer output if available, else generator)
+    output_json = final["reviewed_cases"] or final["test_cases"]
+    csv_path = save_tests_to_csv(output_json, "./generated_test_cases_hybrid.csv")
+    print(f"\nCSV written to: {csv_path}")
